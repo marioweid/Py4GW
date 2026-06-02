@@ -11,6 +11,7 @@ from Py4GWCoreLib import Range, Agent, ConsoleLog, Player
 from Py4GWCoreLib import AgentArray, Weapon, Routines
 from Py4GWCoreLib.IniManager import IniManager
 from Py4GWCoreLib.EnemyBlacklist import EnemyBlacklist
+from Py4GWCoreLib.py4gwcorelib_src.FrameCache import frame_cache
 
 INI_DIR = "HeroAI"
 MAIN_WINDOW_INI = "main_window.ini"
@@ -219,9 +220,10 @@ class CacheData:
     def IsHeadlessCombatPauseActive(self) -> bool:
         return bool(self.data.in_aggro or self.data.local_in_aggro)
         
+    @frame_cache(category="HeroAI", source_lib="CacheData.UpdateCombat", key=lambda self: id(self))
     def UpdateCombat(self):
         self.combat_handler.Update(self)
-        self.combat_handler.PrioritizeSkills()
+        self.combat_handler.RefreshSkills()
         
     def Update(self):
         try:

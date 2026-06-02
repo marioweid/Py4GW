@@ -87,13 +87,18 @@ class CombatClass:
     global MAX_SKILLS, custom_skill_data_handler
 
     class SkillData:
+        slot: int
         skill_id: int
         skillbar_data: SkillbarDataLike
         custom_skill_data: CustomSkill
 
-        def __init__(self, slot: int) -> None:
-            self.skill_id = int(GLOBAL_CACHE.SkillBar.GetSkillIDBySlot(slot) or 0)  # slot is 1 based
-            self.skillbar_data = GLOBAL_CACHE.SkillBar.GetSkillData(slot)  # Fetch additional data from the skill bar
+        def __init__(self, slot: int, skill_id: int | None = None) -> None:
+            self.slot = slot
+            self.skill_id = int(GLOBAL_CACHE.SkillBar.GetSkillIDBySlot(slot) if skill_id is None else skill_id or 0)
+            self.RefreshLiveData()
+
+        def RefreshLiveData(self) -> None:
+            self.skillbar_data = GLOBAL_CACHE.SkillBar.GetSkillData(self.slot)
             self.custom_skill_data = custom_skill_data_handler.get_skill(self.skill_id)  # Retrieve custom skill data
 
     def __init__(self) -> None:
@@ -105,6 +110,8 @@ class CombatClass:
         
         self.skills: list[CombatClass.SkillData] = []
         self.skill_order: list[int] = [0] * MAX_SKILLS
+        self.skillbar_signature: tuple[int, ...] | None = None
+        self.skill_priority_signature: tuple[tuple[int, int, int], ...] | None = None
         self.skill_pointer: int = 0
         self.in_casting_routine: bool = False
         self.aftercast: int = 0
@@ -334,14 +341,55 @@ class CombatClass:
         
 
     #region PrioritizeSkills
-    def PrioritizeSkills(self) -> None:
+    @staticmethod
+    def _GetSkillbarSignature() -> tuple[int, ...]:
+        return tuple(int(GLOBAL_CACHE.SkillBar.GetSkillIDBySlot(slot) or 0) for slot in range(1, MAX_SKILLS + 1))
+
+    @staticmethod
+    def _GetSkillPrioritySignature(skillbar_signature: tuple[int, ...]) -> tuple[tuple[int, int, int], ...]:
+        signature: list[tuple[int, int, int]] = []
+        for skill_id in skillbar_signature:
+            custom_skill_data = custom_skill_data_handler.get_skill(skill_id)
+            signature.append(
+                (
+                    skill_id,
+                    int(custom_skill_data.Nature),
+                    int(custom_skill_data.SkillType),
+                )
+            )
+        return tuple(signature)
+
+    def RefreshSkills(self) -> None:
+        skillbar_signature = self._GetSkillbarSignature()
+        skill_priority_signature = self._GetSkillPrioritySignature(skillbar_signature)
+        if (
+            skillbar_signature != self.skillbar_signature
+            or skill_priority_signature != self.skill_priority_signature
+            or len(self.skills) != MAX_SKILLS
+        ):
+            self.PrioritizeSkills(skillbar_signature, skill_priority_signature)
+            return
+
+        for skill in self.skills:
+            skill.RefreshLiveData()
+
+    def PrioritizeSkills(
+        self,
+        skillbar_signature: tuple[int, ...] | None = None,
+        skill_priority_signature: tuple[tuple[int, int, int], ...] | None = None,
+    ) -> None:
         """
         Create a priority-based skill execution order.
         """
+        if skillbar_signature is None:
+            skillbar_signature = self._GetSkillbarSignature()
+        if skill_priority_signature is None:
+            skill_priority_signature = self._GetSkillPrioritySignature(skillbar_signature)
+
         #initialize skillbar
         original_skills : list[CombatClass.SkillData] = []
         for i in range(MAX_SKILLS):
-            original_skills.append(self.SkillData(i+1))
+            original_skills.append(self.SkillData(i + 1, skillbar_signature[i]))
 
         # Initialize the pointer and tracking list
         ptr = 0
@@ -441,6 +489,8 @@ class CombatClass:
                 ordered_skills.append(original_skills[i])
         
         self.skills = ordered_skills
+        self.skillbar_signature = skillbar_signature
+        self.skill_priority_signature = skill_priority_signature
         
         
     def GetSkills(self) -> list[CombatClass.SkillData]:
