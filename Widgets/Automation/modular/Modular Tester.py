@@ -15,14 +15,11 @@ from Py4GWCoreLib.modular import BTRecipeRunner
 from Py4GWCoreLib.modular import RecipeSpec
 from Py4GWCoreLib.modular.paths import modular_data_root
 from Py4GWCoreLib.modular.widget_runtime import guarded_widget_main
-from Sources.modular_data.prebuilt import apply_eotn_start_index
-from Sources.modular_data.prebuilt import apply_nightfall_start_index
-from Sources.modular_data.prebuilt import apply_prophecies_start_index
 from Sources.modular_data.prebuilt import build_eotn_campaign_specs
 from Sources.modular_data.prebuilt import build_nightfall_campaign_specs
 from Sources.modular_data.prebuilt import build_prophecies_campaign_specs
-from Sources.modular_data.prebuilt import create_modular_fow_bot
 from Sources.modular_data.prebuilt import EOTN_REGION_SPANS
+from Sources.modular_data.prebuilt import FOW_QUEST_ORDER
 from Sources.modular_data.prebuilt import NIGHTFALL_REGION_SPANS
 from Sources.modular_data.prebuilt import PROPHECIES_REGION_SPANS
 
@@ -75,13 +72,17 @@ _draw_move_path_thickness = 4.0
 _draw_move_waypoint_radius = 15.0
 _draw_move_current_waypoint_radius = 20.0
 
-_FOW_CAMPAIGN = "Fissure of Woe"
-_CAMPAIGNS: dict[str, tuple] = {
-    "Eye of the North": (build_eotn_campaign_specs, EOTN_REGION_SPANS, apply_eotn_start_index),
-    "Nightfall": (build_nightfall_campaign_specs, NIGHTFALL_REGION_SPANS, apply_nightfall_start_index),
-    "Prophecies": (build_prophecies_campaign_specs, PROPHECIES_REGION_SPANS, apply_prophecies_start_index),
+def _build_fow_specs() -> list[RecipeSpec]:
+    return [RecipeSpec(kind="quest", key=f"FoW/{key}", title=title) for key, title in FOW_QUEST_ORDER]
+
+
+_CAMPAIGNS: dict[str, Any] = {
+    "Eye of the North": (build_eotn_campaign_specs, EOTN_REGION_SPANS),
+    "Nightfall": (build_nightfall_campaign_specs, NIGHTFALL_REGION_SPANS),
+    "Prophecies": (build_prophecies_campaign_specs, PROPHECIES_REGION_SPANS),
+    "Fissure of Woe": (_build_fow_specs, None),
 }
-_campaign_names: list[str] = list(_CAMPAIGNS.keys()) + [_FOW_CAMPAIGN]
+_campaign_names: list[str] = list(_CAMPAIGNS.keys())
 _selected_campaign_index = 0
 _campaign_start_phase = 0
 
@@ -364,23 +365,20 @@ def _start_selected_campaign() -> None:
     global _runner, _status, _last_recipe
     name = _campaign_names[_selected_campaign_index]
     try:
-        if name in _CAMPAIGNS:
-            build_fn, _spans, apply_fn = _CAMPAIGNS[name]
-            specs = build_fn()
-            start = apply_fn(specs, _campaign_start_phase)
-            runner = BTRecipeRunner(
-                name=f"Modular {name}",
-                specs=specs,
-                start_index=start,
-                loop=bool(_loop),
-                debug_hook=_debug,
-            )
-        else:
-            runner = create_modular_fow_bot(debug_hook=_debug)
+        build_fn, _spans = _CAMPAIGNS[name]
+        specs = build_fn()
+        start = max(0, min(_campaign_start_phase, len(specs) - 1)) if specs else 0
+        runner = BTRecipeRunner(
+            name=f"Modular {name}",
+            specs=specs,
+            start_index=start,
+            loop=bool(_loop),
+            debug_hook=_debug,
+        )
         runner.start()
         _runner = runner
         _last_recipe = ""
-        _status = f"Started campaign {name}."
+        _status = f"Started campaign {name} at phase {start + 1}."
     except Exception as exc:
         _runner = None
         _status = f"Start failed: {exc}"
@@ -570,10 +568,14 @@ def _draw_left_tabs() -> None:
         PyImGui.end_tab_bar()
 
 
+def _campaign_phase_labels(specs: list[RecipeSpec]) -> list[str]:
+    return [f"{index + 1:02d}. {spec.kind.title()}: {spec.title}" for index, spec in enumerate(specs)]
+
+
 def _draw_campaign_picker() -> None:
     global _selected_campaign_index, _campaign_start_phase
     _draw_section_title("Campaign", f"{len(_campaign_names)} available")
-    PyImGui.text_colored("Run every mission, quest and route of a campaign in order.", MUTED)
+    PyImGui.text_colored("Run a full campaign in order; jump by region or exact phase.", MUTED)
     PyImGui.spacing()
     running = _runner_is_running()
     paused = _runner_is_paused()
@@ -581,7 +583,11 @@ def _draw_campaign_picker() -> None:
     PyImGui.set_next_item_width(max(120.0, PyImGui.get_content_region_avail()[0] - 12.0))
     _selected_campaign_index = PyImGui.combo("##modular_tester_campaign", _selected_campaign_index, _campaign_names)
     name = _campaign_names[_selected_campaign_index]
-    spans = _CAMPAIGNS[name][1] if name in _CAMPAIGNS else []
+    build_fn, spans = _CAMPAIGNS[name]
+    specs = build_fn()
+    labels = _campaign_phase_labels(specs)
+    if _campaign_start_phase >= len(labels):
+        _campaign_start_phase = max(0, len(labels) - 1)
     PyImGui.spacing()
 
     if spans:
@@ -590,15 +596,17 @@ def _draw_campaign_picker() -> None:
         for index, (_region, start, _end) in enumerate(spans):
             if _campaign_start_phase >= start:
                 region_index = index
+        PyImGui.text_colored("Region", MUTED)
         PyImGui.set_next_item_width(max(120.0, PyImGui.get_content_region_avail()[0] - 12.0))
-        new_region = PyImGui.combo("##modular_tester_campaign_phase", region_index, region_labels)
+        new_region = PyImGui.combo("##modular_tester_campaign_region", region_index, region_labels)
         if new_region != region_index:
             _campaign_start_phase = spans[new_region][1]
-            region_index = new_region
-        _draw_label_value("Start region", region_labels[region_index], ACCENT)
-    else:
-        _campaign_start_phase = 0
-        _draw_label_value("Start", "Beginning", MUTED)
+
+    PyImGui.text_colored("Start phase", MUTED)
+    PyImGui.set_next_item_width(max(120.0, PyImGui.get_content_region_avail()[0] - 12.0))
+    if labels:
+        _campaign_start_phase = PyImGui.combo("##modular_tester_campaign_phase", _campaign_start_phase, labels)
+    _draw_label_value("Phases", str(len(labels)), ACCENT)
 
     PyImGui.spacing()
     PyImGui.begin_disabled(running)
