@@ -15,6 +15,16 @@ from Py4GWCoreLib.modular import BTRecipeRunner
 from Py4GWCoreLib.modular import RecipeSpec
 from Py4GWCoreLib.modular.paths import modular_data_root
 from Py4GWCoreLib.modular.widget_runtime import guarded_widget_main
+from Sources.modular_data.prebuilt import apply_eotn_start_index
+from Sources.modular_data.prebuilt import apply_nightfall_start_index
+from Sources.modular_data.prebuilt import apply_prophecies_start_index
+from Sources.modular_data.prebuilt import build_eotn_campaign_specs
+from Sources.modular_data.prebuilt import build_nightfall_campaign_specs
+from Sources.modular_data.prebuilt import build_prophecies_campaign_specs
+from Sources.modular_data.prebuilt import create_modular_fow_bot
+from Sources.modular_data.prebuilt import EOTN_REGION_SPANS
+from Sources.modular_data.prebuilt import NIGHTFALL_REGION_SPANS
+from Sources.modular_data.prebuilt import PROPHECIES_REGION_SPANS
 
 
 MODULE_NAME = "Modular Tester"
@@ -64,6 +74,16 @@ _draw_move_path_labels = False
 _draw_move_path_thickness = 4.0
 _draw_move_waypoint_radius = 15.0
 _draw_move_current_waypoint_radius = 20.0
+
+_FOW_CAMPAIGN = "Fissure of Woe"
+_CAMPAIGNS: dict[str, tuple] = {
+    "Eye of the North": (build_eotn_campaign_specs, EOTN_REGION_SPANS, apply_eotn_start_index),
+    "Nightfall": (build_nightfall_campaign_specs, NIGHTFALL_REGION_SPANS, apply_nightfall_start_index),
+    "Prophecies": (build_prophecies_campaign_specs, PROPHECIES_REGION_SPANS, apply_prophecies_start_index),
+}
+_campaign_names: list[str] = list(_CAMPAIGNS.keys()) + [_FOW_CAMPAIGN]
+_selected_campaign_index = 0
+_campaign_start_phase = 0
 
 
 class _TesterMovePathDrawer(BottingTreeUIMovePathMixin):
@@ -340,6 +360,32 @@ def _start_selected_recipe() -> None:
         _status = f"Start failed: {exc}"
 
 
+def _start_selected_campaign() -> None:
+    global _runner, _status, _last_recipe
+    name = _campaign_names[_selected_campaign_index]
+    try:
+        if name in _CAMPAIGNS:
+            build_fn, _spans, apply_fn = _CAMPAIGNS[name]
+            specs = build_fn()
+            start = apply_fn(specs, _campaign_start_phase)
+            runner = BTRecipeRunner(
+                name=f"Modular {name}",
+                specs=specs,
+                start_index=start,
+                loop=bool(_loop),
+                debug_hook=_debug,
+            )
+        else:
+            runner = create_modular_fow_bot(debug_hook=_debug)
+        runner.start()
+        _runner = runner
+        _last_recipe = ""
+        _status = f"Started campaign {name}."
+    except Exception as exc:
+        _runner = None
+        _status = f"Start failed: {exc}"
+
+
 def _stop_runner() -> None:
     global _status
     if _runner is not None:
@@ -511,6 +557,69 @@ def _draw_top_bar() -> None:
     _draw_move_path = PyImGui.checkbox("Draw path", _draw_move_path)
     PyImGui.same_line(0, 14)
     _draw_move_path_labels = PyImGui.checkbox("Path labels", _draw_move_path_labels)
+
+
+def _draw_left_tabs() -> None:
+    if PyImGui.begin_tab_bar("##modular_tester_left_tabs", PyImGui.TabBarFlags.NoFlag):
+        if PyImGui.begin_tab_item("Recipe"):
+            _draw_recipe_picker()
+            PyImGui.end_tab_item()
+        if PyImGui.begin_tab_item("Campaign"):
+            _draw_campaign_picker()
+            PyImGui.end_tab_item()
+        PyImGui.end_tab_bar()
+
+
+def _draw_campaign_picker() -> None:
+    global _selected_campaign_index, _campaign_start_phase
+    _draw_section_title("Campaign", f"{len(_campaign_names)} available")
+    PyImGui.text_colored("Run every mission, quest and route of a campaign in order.", MUTED)
+    PyImGui.spacing()
+    running = _runner_is_running()
+    paused = _runner_is_paused()
+
+    PyImGui.set_next_item_width(max(120.0, PyImGui.get_content_region_avail()[0] - 12.0))
+    _selected_campaign_index = PyImGui.combo("##modular_tester_campaign", _selected_campaign_index, _campaign_names)
+    name = _campaign_names[_selected_campaign_index]
+    spans = _CAMPAIGNS[name][1] if name in _CAMPAIGNS else []
+    PyImGui.spacing()
+
+    if spans:
+        region_labels = [str(region) for region, _start, _end in spans]
+        region_index = 0
+        for index, (_region, start, _end) in enumerate(spans):
+            if _campaign_start_phase >= start:
+                region_index = index
+        PyImGui.set_next_item_width(max(120.0, PyImGui.get_content_region_avail()[0] - 12.0))
+        new_region = PyImGui.combo("##modular_tester_campaign_phase", region_index, region_labels)
+        if new_region != region_index:
+            _campaign_start_phase = spans[new_region][1]
+            region_index = new_region
+        _draw_label_value("Start region", region_labels[region_index], ACCENT)
+    else:
+        _campaign_start_phase = 0
+        _draw_label_value("Start", "Beginning", MUTED)
+
+    PyImGui.spacing()
+    PyImGui.begin_disabled(running)
+    if _primary_button("Run campaign", 132):
+        _start_selected_campaign()
+    PyImGui.end_disabled()
+    PyImGui.same_line(0, 6)
+    PyImGui.begin_disabled(not running)
+    if _quiet_button("Pause", 78):
+        _pause_runner()
+    PyImGui.end_disabled()
+    PyImGui.same_line(0, 6)
+    PyImGui.begin_disabled(not paused)
+    if _primary_button("Resume", 82):
+        _resume_runner()
+    PyImGui.end_disabled()
+    PyImGui.same_line(0, 6)
+    PyImGui.begin_disabled(not (running or paused))
+    if _danger_button("Stop", 70):
+        _stop_runner()
+    PyImGui.end_disabled()
 
 
 def _draw_recipe_picker() -> None:
@@ -861,7 +970,7 @@ def _draw_main_layout() -> None:
         PyImGui.table_next_row()
         PyImGui.table_set_column_index(0)
         if PyImGui.begin_child("##modular_tester_left", (0, 0), True, PyImGui.WindowFlags.NoFlag):
-            _draw_recipe_picker()
+            _draw_left_tabs()
         PyImGui.end_child()
         PyImGui.table_set_column_index(1)
         if PyImGui.begin_child("##modular_tester_right", (0, 0), True, PyImGui.WindowFlags.NoFlag):
@@ -869,7 +978,7 @@ def _draw_main_layout() -> None:
         PyImGui.end_child()
         PyImGui.end_table()
     else:
-        _draw_recipe_picker()
+        _draw_left_tabs()
         PyImGui.separator()
         _draw_right_panel()
 
