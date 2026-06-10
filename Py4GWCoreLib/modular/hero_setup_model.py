@@ -90,6 +90,7 @@ def _build_default_hero_priority() -> list[int]:
 
 
 DEFAULT_HERO_PRIORITY = _build_default_hero_priority()
+DEFAULT_HENCHMAN_PRIORITY = [5, 6, 1, 3, 2, 4, 7, 8]
 
 
 def safe_account_key() -> str:
@@ -196,6 +197,10 @@ def save_hero_priority(priority: list[int]) -> None:
 
 def get_hero_priority() -> list[int]:
     return normalize_priority(load_hero_priority())
+
+
+def get_henchman_priority() -> list[int]:
+    return list(DEFAULT_HENCHMAN_PRIORITY)
 
 
 def get_team_by_priority(max_heroes: int, required_hero_ids: list[int] | None = None) -> list[int]:

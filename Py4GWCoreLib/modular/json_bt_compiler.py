@@ -83,7 +83,8 @@ LEGACY_STEP_TYPES: tuple[str, ...] = (
 )
 
 DEFAULT_INTERACT_DELAY_MS = 250
-DEFAULT_DIALOG_DELAY_MS = 250
+DEFAULT_DIALOG_READY_TIMEOUT_MS = 5000
+DEFAULT_DIALOG_READY_POLL_MS = 100
 
 
 class RecipeCompileError(ValueError):
@@ -297,15 +298,9 @@ def _build_interact(step: dict[str, Any], context: JsonBTCompilerContext) -> Beh
         if not ids:
             raise RecipeCompileError(f"Recipe {context.recipe_name!r} interact dialog requires id.")
         interval_ms = max(0, _int(step.get("interval_ms"), 0))
-        trees: list[BehaviorTree] = []
-        for dialog_id in ids:
-            if _has_selector(step):
-                trees.append(_interact_and_dialog_tree(step, context, dialog_id))
-            else:
-                trees.append(BT.Player.SendDialog(dialog_id=dialog_id, log=_bool(step.get("log"), False)))
-            if interval_ms:
-                trees.append(BT.Player.Wait(interval_ms, log=False))
-        return _sequence("InteractDialog", trees)
+        if _has_selector(step):
+            return _interact_and_dialog_tree(step, context, ids, interval_ms=interval_ms)
+        return _sequence("SendDialogs", _dialog_send_trees(step, ids, interval_ms=interval_ms))
     if action == "auto_dialog":
         button = _int(step.get("button", step.get("button_number")), 0)
         return BT.Player.SendAutomaticDialog(button_number=button, log=log)
@@ -357,11 +352,14 @@ def _build_party(step: dict[str, Any], context: JsonBTCompilerContext) -> Behavi
     action = _choice(step, "action", "")
     log = _bool(step.get("log"), False)
     if action == "load":
+        load_log = _bool(step.get("log", step.get("debug")), True)
         return BT.Party.LoadParty(
             hero_ids=_party_hero_ids(step, context),
-            henchman_ids=_int_list(step.get("henchman_ids", step.get("henchmen"))),
+            henchman_ids=_party_henchman_ids(step),
+            target_party_size=_party_target_size(step),
             clear_existing=_bool(step.get("clear_existing"), False),
-            log=log,
+            log=load_log,
+            add_timeout_ms=max(0, _int(step.get("add_timeout_ms"), 50)),
         )
     if action == "flag_heroes":
         point = _require_point(step)
@@ -548,7 +546,13 @@ def _route_to_target_tree(step: dict[str, Any], context: JsonBTCompilerContext) 
     )
 
 
-def _interact_and_dialog_tree(step: dict[str, Any], context: JsonBTCompilerContext, dialog_id: str | int) -> BehaviorTree:
+def _interact_and_dialog_tree(
+    step: dict[str, Any],
+    context: JsonBTCompilerContext,
+    dialog_ids: list[str | int],
+    *,
+    interval_ms: int = 0,
+) -> BehaviorTree:
     log = _bool(step.get("log"), False)
     target = _choice(step, "target", _choice(step, "kind", "npc"))
     if "gadget" in step and "target" not in step and "kind" not in step:
@@ -568,9 +572,50 @@ def _interact_and_dialog_tree(step: dict[str, Any], context: JsonBTCompilerConte
         _interact_delay_tree(step),
         _target_tree(step, context, target),
         BT.Player.InteractTarget(log=log),
-        _dialog_delay_tree(step),
-        BT.Player.SendDialog(dialog_id=dialog_id, log=log),
+        *_dialog_send_trees(step, dialog_ids, interval_ms=interval_ms),
         name="InteractDialog",
+    )
+
+
+def _dialog_send_trees(
+    step: dict[str, Any],
+    dialog_ids: list[str | int],
+    *,
+    interval_ms: int = 0,
+) -> list[BehaviorTree]:
+    log = _bool(step.get("log"), False)
+    trees: list[BehaviorTree] = []
+    for index, dialog_id in enumerate(dialog_ids):
+        trees.append(_wait_for_dialog_ready_tree(step))
+        trees.append(BT.Player.SendDialog(dialog_id=dialog_id, log=log))
+        if interval_ms > 0 and index < len(dialog_ids) - 1:
+            trees.append(BT.Player.Wait(interval_ms, log=False))
+    return trees
+
+
+def _wait_for_dialog_ready_tree(step: dict[str, Any]) -> BehaviorTree:
+    timeout_ms = max(0, _int(step.get("dialog_ready_timeout_ms"), DEFAULT_DIALOG_READY_TIMEOUT_MS))
+    poll_ms = max(1, _int(step.get("dialog_ready_poll_ms"), DEFAULT_DIALOG_READY_POLL_MS))
+
+    def _dialog_ready(_node: BehaviorTree.Node) -> BehaviorTree.NodeState:
+        try:
+            from Py4GWCoreLib import Dialog
+
+            if Dialog.get_active_dialog() is not None:
+                return BehaviorTree.NodeState.SUCCESS
+            if Dialog.get_active_dialog_buttons():
+                return BehaviorTree.NodeState.SUCCESS
+        except Exception:
+            return BehaviorTree.NodeState.RUNNING
+        return BehaviorTree.NodeState.RUNNING
+
+    return BehaviorTree(
+        BehaviorTree.WaitUntilNode(
+            name="WaitForDialogReady",
+            condition_fn=_dialog_ready,
+            throttle_interval_ms=poll_ms,
+            timeout_ms=timeout_ms,
+        )
     )
 
 
@@ -609,11 +654,6 @@ def _move_to_selected_target_tree(step: dict[str, Any], *, log: bool) -> Behavio
 def _interact_delay_tree(step: dict[str, Any]) -> BehaviorTree:
     delay_ms = max(0, _int(step.get("interact_delay_ms", step.get("settle_ms")), DEFAULT_INTERACT_DELAY_MS))
     return BT.Player.Wait(delay_ms, log=False) if delay_ms > 0 else BehaviorTree(BehaviorTree.SucceederNode(name="NoInteractDelay"))
-
-
-def _dialog_delay_tree(step: dict[str, Any]) -> BehaviorTree:
-    delay_ms = max(0, _int(step.get("dialog_delay_ms"), DEFAULT_DIALOG_DELAY_MS))
-    return BT.Player.Wait(delay_ms, log=False) if delay_ms > 0 else BehaviorTree(BehaviorTree.SucceederNode(name="NoDialogDelay"))
 
 
 def _target_tree(step: dict[str, Any], context: JsonBTCompilerContext, target: str) -> BehaviorTree:
@@ -892,7 +932,7 @@ def _party_hero_ids(step: dict[str, Any], context: JsonBTCompilerContext) -> lis
     if explicit:
         return explicit
 
-    from .hero_setup_model import get_team_by_priority
+    from .hero_setup_model import get_hero_priority
     from .hero_setup_model import resolve_hero_ids
 
     required_source = step.get("required_hero", context.required_hero)
@@ -900,11 +940,35 @@ def _party_hero_ids(step: dict[str, Any], context: JsonBTCompilerContext) -> lis
     if required_source and not required:
         raise RecipeCompileError(f"Recipe {context.recipe_name!r} has unresolved required_hero {required_source!r}.")
 
-    max_heroes = max(1, _int(step.get("max_heroes"), 7))
-    hero_ids = get_team_by_priority(max_heroes=max_heroes, required_hero_ids=required)
-    if max_heroes > 1 and not hero_ids:
+    hero_ids: list[int] = []
+    for hero_id in required + get_hero_priority():
+        hero_id = int(hero_id)
+        if hero_id > 0 and hero_id not in hero_ids:
+            hero_ids.append(hero_id)
+    if _party_target_size(step) > 1 and not hero_ids:
         raise RecipeCompileError(f"Recipe {context.recipe_name!r} party load resolved to an empty hero list.")
     return hero_ids
+
+
+def _party_henchman_ids(step: dict[str, Any]) -> list[int]:
+    explicit = _int_list(step.get("henchman_ids", step.get("henchmen")))
+    if explicit:
+        return explicit
+
+    try:
+        from .hero_setup_model import get_henchman_priority
+
+        return get_henchman_priority()
+    except Exception:
+        return [5, 6, 1, 3, 2, 4, 7, 8]
+
+
+def _party_target_size(step: dict[str, Any]) -> int:
+    for key in ("party_size", "max_party_size", "max_heroes"):
+        value = _int(step.get(key), 0)
+        if value > 0:
+            return max(1, min(8, value))
+    return 8
 
 
 def _has_selector(step: dict[str, Any]) -> bool:

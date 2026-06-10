@@ -61,6 +61,20 @@ class _SubtreeNode(_Node):
         self.subtree_fn = subtree_fn
 
 
+class _WaitUntilNode(_Node):
+    def __init__(
+        self,
+        name: str = "WaitUntilNode",
+        condition_fn=None,
+        throttle_interval_ms: int = 100,
+        timeout_ms: int = 0,
+    ) -> None:
+        super().__init__(name=name)
+        self.condition_fn = condition_fn
+        self.throttle_interval_ms = int(throttle_interval_ms)
+        self.timeout_ms = int(timeout_ms)
+
+
 class _BehaviorTree:
     NodeState = _NodeState
     Node = _Node
@@ -68,6 +82,7 @@ class _BehaviorTree:
     SequenceNode = _SequenceNode
     SubtreeNode = _SubtreeNode
     SucceederNode = _Node
+    WaitUntilNode = _WaitUntilNode
 
     def __init__(self, root: _Node) -> None:
         self.root = root
@@ -163,7 +178,8 @@ def _install_stubs() -> None:
     sys.modules["Py4GWCoreLib.routines_src.BehaviourTrees"] = bt_mod
 
     hero_setup_model = types.ModuleType("Py4GWCoreLib.modular.hero_setup_model")
-    hero_setup_model.get_team_by_priority = _stub_get_team_by_priority
+    hero_setup_model.get_henchman_priority = _stub_get_henchman_priority
+    hero_setup_model.get_hero_priority = _stub_get_hero_priority
     hero_setup_model.resolve_hero_ids = _stub_resolve_hero_ids
     sys.modules["Py4GWCoreLib.modular.hero_setup_model"] = hero_setup_model
 
@@ -197,14 +213,12 @@ _HERO_NAME_TO_ID = {
 _DEFAULT_PRIORITY = [24, 27, 21, 26, 25, 4, 37, 3, 6, 7, 9, 10, 11]
 
 
-def _stub_get_team_by_priority(max_heroes: int, required_hero_ids=None) -> list[int]:
-    slots = max(0, int(max_heroes) - 1)
-    team: list[int] = []
-    for hero_id in list(required_hero_ids or []) + _DEFAULT_PRIORITY:
-        hero_id = int(hero_id)
-        if hero_id > 0 and hero_id not in team:
-            team.append(hero_id)
-    return team[:slots]
+def _stub_get_hero_priority() -> list[int]:
+    return list(_DEFAULT_PRIORITY)
+
+
+def _stub_get_henchman_priority() -> list[int]:
+    return [5, 6, 1, 3, 2, 4, 7, 8]
 
 
 def _stub_resolve_hero_ids(value: Any) -> list[int]:
@@ -247,14 +261,18 @@ def _assert_party_load_shape(tree: _BehaviorTree, recipe: dict[str, Any]) -> int
         if getattr(node, "name", "") != "LoadParty":
             raise AssertionError(f"party load step {index + 1} did not compile to BT.Party.LoadParty")
         hero_ids = list(getattr(node, "kwargs", {}).get("hero_ids") or [])
+        henchman_ids = list(getattr(node, "kwargs", {}).get("henchman_ids") or [])
+        target_party_size = int(getattr(node, "kwargs", {}).get("target_party_size") or 0)
         max_heroes = int(step.get("max_heroes", 7) or 7)
         if max_heroes > 1 and not hero_ids:
             raise AssertionError(f"party load step {index + 1} resolved no heroes")
-        if len(hero_ids) > max(0, max_heroes - 1):
-            raise AssertionError(f"party load step {index + 1} resolved too many heroes: {hero_ids}")
+        if target_party_size != max(1, min(8, max_heroes)):
+            raise AssertionError(f"party load step {index + 1} target size mismatch: {target_party_size}")
+        if not henchman_ids:
+            raise AssertionError(f"party load step {index + 1} resolved no henchmen")
         required = _stub_resolve_hero_ids(step.get("required_hero", recipe.get("required_hero")))
         missing = [hero_id for hero_id in required if hero_id not in hero_ids]
-        if missing and len(required) <= max(0, max_heroes - 1):
+        if missing:
             raise AssertionError(f"party load step {index + 1} is missing required hero ids {missing}")
         verified += 1
     return verified

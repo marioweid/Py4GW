@@ -19,6 +19,7 @@ from ...Player import Player
 from ...Py4GWcorelib import ConsoleLog, Console
 from ...Skillbar import SkillBar
 from ...py4gwcorelib_src.BehaviorTree import BehaviorTree
+from ...py4gwcorelib_src.Utils import Utils
 from .composite import BTComposite
 
 
@@ -57,6 +58,71 @@ def _clear_multibox_all_flags() -> None:
         options.AllFlag.x = 0.0
         options.AllFlag.y = 0.0
         options.FlagFacingAngle = 0.0
+
+
+def _dedupe_positive_ints(values: Sequence[int] | None) -> list[int]:
+    result: list[int] = []
+    for value in values or []:
+        try:
+            candidate = int(value)
+        except (TypeError, ValueError):
+            continue
+        if candidate > 0 and candidate not in result:
+            result.append(candidate)
+    return result
+
+
+def _new_party_load_state() -> dict[str, int | str | bool]:
+    return {
+        "phase": "init",
+        "hero_index": 0,
+        "henchman_index": 0,
+        "wait_id": 0,
+        "wait_name": "",
+        "before_size": 0,
+        "before_heroes": 0,
+        "before_henchmen": 0,
+        "wait_started_ms": 0,
+        "complete": False,
+    }
+
+
+def _party_counts() -> tuple[int, int, int, int]:
+    players = int(Party.GetPlayerCount() or 1)
+    heroes = int(Party.GetHeroCount() or 0)
+    henchmen = int(Party.GetHenchmanCount() or 0)
+    players = max(1, players)
+    return players, heroes, henchmen, players + heroes + henchmen
+
+
+def _existing_hero_ids() -> set[int]:
+    existing_heroes: set[int] = set()
+    for hero in Party.GetHeroes() or []:
+        hero_id = _hero_member_id(hero)
+        if hero_id > 0:
+            existing_heroes.add(hero_id)
+    return existing_heroes
+
+
+def _hero_member_id(hero: object) -> int:
+    raw_id = getattr(hero, "hero_id", 0)
+    try:
+        if hasattr(raw_id, "GetID"):
+            return int(raw_id.GetID() or 0)
+        if hasattr(raw_id, "id"):
+            return int(raw_id.id or 0)
+        return int(raw_id or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _hero_name(hero_id: int) -> str:
+    try:
+        from ...modular.hero_setup_model import HERO_ID_TO_NAME
+
+        return str(HERO_ID_TO_NAME.get(int(hero_id), f"Hero {int(hero_id)}"))
+    except Exception:
+        return f"Hero {int(hero_id)}"
 
 
 class BTParty:
@@ -289,10 +355,12 @@ class BTParty:
     def LoadParty(
         hero_ids: list[int] | None = None,
         henchman_ids: list[int] | None = None,
+        target_party_size: int = 8,
         clear_existing: bool = False,
         require_outpost: bool = True,
         log: bool = False,
         aftercast_ms: int = 250,
+        add_timeout_ms: int = 50,
     ) -> BehaviorTree:
         """
         Build an action tree that loads party heroes/henchmen.
@@ -306,42 +374,206 @@ class BTParty:
           Notes: This routine is leader-only and can be restricted to outposts.
         """
 
-        hero_ids = [int(h) for h in (hero_ids or []) if int(h) > 0]
-        henchman_ids = [int(h) for h in (henchman_ids or []) if int(h) > 0]
+        hero_ids = _dedupe_positive_ints(hero_ids)
+        henchman_ids = _dedupe_positive_ints(henchman_ids)
+        target_party_size = max(1, min(8, int(target_party_size or 8)))
+        add_timeout_ms = max(0, int(add_timeout_ms))
+        state = _new_party_load_state()
 
-        def _load_party() -> BehaviorTree.NodeState:
-            if not Party.IsPartyLeader():
-                _fail_log("BTParty.LoadParty", "Failed to load party: local player is not party leader.")
-                return BehaviorTree.NodeState.FAILURE
+        def _load_party(node: BehaviorTree.Node) -> BehaviorTree.NodeState:
+            if bool(state["complete"]) and node.last_state != BehaviorTree.NodeState.RUNNING:
+                state.update(_new_party_load_state())
 
-            if require_outpost and not Map.IsOutpost():
-                _fail_log("BTParty.LoadParty", "Failed to load party: can only add party members in outpost.")
-                return BehaviorTree.NodeState.FAILURE
+            while True:
+                phase = str(state["phase"])
+                if phase == "init":
+                    if not Party.IsPartyLeader():
+                        _fail_log("BTParty.LoadParty", "Failed to load party: local player is not party leader.")
+                        state["complete"] = True
+                        return BehaviorTree.NodeState.FAILURE
 
-            if clear_existing:
-                Party.Heroes.KickAllHeroes()
+                    if require_outpost and not Map.IsOutpost():
+                        _fail_log("BTParty.LoadParty", "Failed to load party: can only add party members in outpost.")
+                        state["complete"] = True
+                        return BehaviorTree.NodeState.FAILURE
 
-            existing_heroes = set()
-            for hero in Party.GetHeroes() or []:
-                hid = int(getattr(hero, "hero_id", 0) or 0)
-                if hid > 0:
-                    existing_heroes.add(hid)
+                    if clear_existing:
+                        Party.Heroes.KickAllHeroes()
+                        _log("BTParty.LoadParty", "Cleared existing heroes before party load.", log=log)
 
-            for hero_id in hero_ids:
-                if hero_id in existing_heroes:
+                    players, heroes, henchmen, current_size = _party_counts()
+                    state["phase"] = "heroes"
+                    _log(
+                        "BTParty.LoadParty",
+                        "Starting priority party load "
+                        f"party={current_size}/{target_party_size}, players={players}, heroes={heroes}, "
+                        f"henchmen={henchmen}, hero_candidates={len(hero_ids)}, "
+                        f"henchman_candidates={len(henchman_ids)}.",
+                        log=log,
+                    )
                     continue
-                Party.Heroes.AddHero(hero_id)
-                existing_heroes.add(hero_id)
 
-            for henchman_id in henchman_ids:
-                Party.Henchmen.AddHenchman(henchman_id)
+                if phase == "heroes":
+                    players, heroes, henchmen, current_size = _party_counts()
+                    hero_slots = max(0, target_party_size - players)
+                    if current_size >= target_party_size:
+                        state["phase"] = "done"
+                        continue
+                    if heroes >= hero_slots:
+                        _log(
+                            "BTParty.LoadParty",
+                            f"Hero slot target reached heroes={heroes}/{hero_slots}; switching to henchmen.",
+                            log=log,
+                        )
+                        state["phase"] = "henchmen"
+                        continue
 
-            _log(
-                "BTParty.LoadParty",
-                f"LoadParty dispatched heroes={hero_ids}, henchmen={henchman_ids}, clear_existing={clear_existing}",
-                log=log,
-            )
-            return BehaviorTree.NodeState.SUCCESS
+                    existing_heroes = _existing_hero_ids()
+                    while int(state["hero_index"]) < len(hero_ids):
+                        hero_id = hero_ids[int(state["hero_index"])]
+                        state["hero_index"] = int(state["hero_index"]) + 1
+                        hero_name = _hero_name(hero_id)
+                        if hero_id in existing_heroes:
+                            _log(
+                                "BTParty.LoadParty",
+                                f"Hero already in party: {hero_name} ({hero_id}); "
+                                f"party={current_size}/{target_party_size}.",
+                                log=log,
+                            )
+                            continue
+
+                        _log(
+                            "BTParty.LoadParty",
+                            f"Trying hero {hero_name} ({hero_id}); party={current_size}/{target_party_size}, "
+                            f"heroes={heroes}/{hero_slots}.",
+                            log=log,
+                        )
+                        try:
+                            Party.Heroes.AddHero(hero_id)
+                        except Exception as exc:
+                            _fail_log(
+                                "BTParty.LoadParty",
+                                f"Hero {hero_name} ({hero_id}) add raised {type(exc).__name__}: {exc}.",
+                            )
+                            continue
+                        if add_timeout_ms <= 0:
+                            _log(
+                                "BTParty.LoadParty",
+                                f"Hero add dispatched: {hero_name} ({hero_id}); no join wait.",
+                                log=log,
+                            )
+                            existing_heroes.add(hero_id)
+                            continue
+                        state["phase"] = "hero_wait"
+                        state["wait_id"] = hero_id
+                        state["wait_name"] = hero_name
+                        state["before_size"] = current_size
+                        state["before_heroes"] = heroes
+                        state["wait_started_ms"] = Utils.GetBaseTimestamp()
+                        return BehaviorTree.NodeState.RUNNING
+
+                    _log("BTParty.LoadParty", "Hero priority list exhausted; switching to henchmen.", log=log)
+                    state["phase"] = "henchmen"
+                    continue
+
+                if phase == "hero_wait":
+                    hero_id = int(state["wait_id"])
+                    hero_name = str(state["wait_name"])
+                    players, heroes, henchmen, current_size = _party_counts()
+                    if hero_id in _existing_hero_ids() or heroes > int(state["before_heroes"]):
+                        _log(
+                            "BTParty.LoadParty",
+                            f"Hero joined: {hero_name} ({hero_id}); party={current_size}/{target_party_size}, "
+                            f"heroes={heroes}.",
+                            log=log,
+                        )
+                        state["phase"] = "heroes"
+                        continue
+                    if Utils.GetBaseTimestamp() - int(state["wait_started_ms"]) >= add_timeout_ms:
+                        _log(
+                            "BTParty.LoadParty",
+                            f"Hero did not join, skipping: {hero_name} ({hero_id}); "
+                            f"party={current_size}/{target_party_size}.",
+                            log=log,
+                            message_type=Console.MessageType.Warning,
+                        )
+                        state["phase"] = "heroes"
+                        continue
+                    return BehaviorTree.NodeState.RUNNING
+
+                if phase == "henchmen":
+                    players, heroes, henchmen, current_size = _party_counts()
+                    if current_size >= target_party_size:
+                        state["phase"] = "done"
+                        continue
+                    while int(state["henchman_index"]) < len(henchman_ids):
+                        henchman_id = henchman_ids[int(state["henchman_index"])]
+                        state["henchman_index"] = int(state["henchman_index"]) + 1
+                        _log(
+                            "BTParty.LoadParty",
+                            f"Trying henchman {henchman_id}; party={current_size}/{target_party_size}, "
+                            f"henchmen={henchmen}.",
+                            log=log,
+                        )
+                        try:
+                            Party.Henchmen.AddHenchman(henchman_id)
+                        except Exception as exc:
+                            _fail_log(
+                                "BTParty.LoadParty",
+                                f"Henchman {henchman_id} add raised {type(exc).__name__}: {exc}.",
+                            )
+                            continue
+                        if add_timeout_ms <= 0:
+                            _log(
+                                "BTParty.LoadParty",
+                                f"Henchman add dispatched: {henchman_id}; no join wait.",
+                                log=log,
+                            )
+                            continue
+                        state["phase"] = "henchman_wait"
+                        state["wait_id"] = henchman_id
+                        state["before_size"] = current_size
+                        state["before_henchmen"] = henchmen
+                        state["wait_started_ms"] = Utils.GetBaseTimestamp()
+                        return BehaviorTree.NodeState.RUNNING
+
+                    state["phase"] = "done"
+                    continue
+
+                if phase == "henchman_wait":
+                    henchman_id = int(state["wait_id"])
+                    players, heroes, henchmen, current_size = _party_counts()
+                    if henchmen > int(state["before_henchmen"]) or current_size > int(state["before_size"]):
+                        _log(
+                            "BTParty.LoadParty",
+                            f"Henchman joined: {henchman_id}; party={current_size}/{target_party_size}, "
+                            f"henchmen={henchmen}.",
+                            log=log,
+                        )
+                        state["phase"] = "henchmen"
+                        continue
+                    if Utils.GetBaseTimestamp() - int(state["wait_started_ms"]) >= add_timeout_ms:
+                        _log(
+                            "BTParty.LoadParty",
+                            f"Henchman did not join, skipping: {henchman_id}; "
+                            f"party={current_size}/{target_party_size}.",
+                            log=log,
+                            message_type=Console.MessageType.Warning,
+                        )
+                        state["phase"] = "henchmen"
+                        continue
+                    return BehaviorTree.NodeState.RUNNING
+
+                players, heroes, henchmen, current_size = _party_counts()
+                _log(
+                    "BTParty.LoadParty",
+                    f"Finished party load party={current_size}/{target_party_size}, players={players}, "
+                    f"heroes={heroes}, henchmen={henchmen}.",
+                    log=log,
+                    message_type=Console.MessageType.Notice,
+                )
+                state["complete"] = True
+                return BehaviorTree.NodeState.SUCCESS
 
         return BehaviorTree(
             BehaviorTree.ActionNode(

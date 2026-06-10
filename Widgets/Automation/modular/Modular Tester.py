@@ -13,8 +13,13 @@ from Py4GWCoreLib import ConsoleLog
 from Py4GWCoreLib.botting_tree_src.ui import BottingTreeUIMovePathMixin
 from Py4GWCoreLib.modular import BTRecipeRunner
 from Py4GWCoreLib.modular import RecipeSpec
+from Py4GWCoreLib.modular.hero_setup import draw_team_configuration_window
+from Py4GWCoreLib.modular.hero_setup import get_hero_priority
+from Py4GWCoreLib.modular.hero_setup import show_team_configuration_window
 from Py4GWCoreLib.modular.paths import modular_data_root
 from Py4GWCoreLib.modular.widget_runtime import guarded_widget_main
+from Py4GWCoreLib.py4gwcorelib_src.BehaviorTree import BehaviorTree
+from Py4GWCoreLib.routines_src.BehaviourTrees import BT
 from Sources.modular_data.prebuilt import build_eotn_campaign_specs
 from Sources.modular_data.prebuilt import build_nightfall_campaign_specs
 from Sources.modular_data.prebuilt import build_prophecies_campaign_specs
@@ -60,6 +65,7 @@ _selected_recipe = ""
 _browser_path: list[str] = []
 _filter_text = ""
 _runner: BTRecipeRunner | None = None
+_party_load_tree: BehaviorTree | None = None
 _status = ""
 _last_recipe = ""
 _loop = False
@@ -339,11 +345,12 @@ def _spec_from_relative_path(relative_path: str) -> RecipeSpec:
 
 
 def _start_selected_recipe() -> None:
-    global _runner, _status, _last_recipe
+    global _party_load_tree, _runner, _status, _last_recipe
     relative_path = _selected_recipe_path()
     if not relative_path:
         _status = "No recipe selected."
         return
+    _party_load_tree = None
     try:
         runner = BTRecipeRunner(
             name=f"Modular Tester: {relative_path}",
@@ -361,10 +368,75 @@ def _start_selected_recipe() -> None:
         _status = f"Start failed: {exc}"
 
 
+def _recipe_load_party_size(relative_path: str) -> int:
+    recipe = _read_recipe(relative_path)
+    steps = recipe.get("steps", [])
+    if not isinstance(steps, list):
+        return 8
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        if str(step.get("type") or "").strip().lower() != "party":
+            continue
+        if str(step.get("action") or "").strip().lower() != "load":
+            continue
+        for key in ("party_size", "max_party_size", "max_heroes"):
+            try:
+                value = int(step.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                return max(1, min(8, value))
+    return 8
+
+
+def _load_using_priority() -> None:
+    global _party_load_tree, _status
+    target_size = _recipe_load_party_size(_selected_recipe_path())
+    _party_load_tree = BT.Party.LoadParty(
+        hero_ids=get_hero_priority(),
+        henchman_ids=_henchman_priority(),
+        target_party_size=target_size,
+        log=True,
+        add_timeout_ms=50,
+    )
+    _status = f"Priority party load started for target party size {target_size}."
+
+
+def _henchman_priority() -> list[int]:
+    try:
+        from Py4GWCoreLib.modular.hero_setup import get_henchman_priority
+
+        return list(get_henchman_priority())
+    except Exception:
+        return [5, 6, 1, 3, 2, 4, 7, 8]
+
+
+def _update_party_load_tree() -> None:
+    global _party_load_tree, _status
+    if _party_load_tree is None:
+        return
+    try:
+        state = _party_load_tree.tick()
+    except Exception as exc:
+        _party_load_tree = None
+        _status = f"Priority party load failed: {type(exc).__name__}: {exc}"
+        return
+    if state == BehaviorTree.NodeState.RUNNING:
+        _status = "Priority party load running..."
+        return
+    _party_load_tree = None
+    if state == BehaviorTree.NodeState.SUCCESS:
+        _status = "Priority party load finished."
+    else:
+        _status = "Priority party load failed."
+
+
 def _start_selected_campaign() -> None:
-    global _runner, _status, _last_recipe
+    global _party_load_tree, _runner, _status, _last_recipe
     name = _campaign_names[_selected_campaign_index]
     try:
+        _party_load_tree = None
         build_fn, _spans = _CAMPAIGNS[name]
         specs = build_fn()
         start = max(0, min(_campaign_start_phase, len(specs) - 1)) if specs else 0
@@ -555,6 +627,14 @@ def _draw_top_bar() -> None:
     _draw_move_path = PyImGui.checkbox("Draw path", _draw_move_path)
     PyImGui.same_line(0, 14)
     _draw_move_path_labels = PyImGui.checkbox("Path labels", _draw_move_path_labels)
+    PyImGui.same_line(0, 14)
+    if _quiet_button("Team Build", 94):
+        show_team_configuration_window("modular_tester")
+    PyImGui.same_line(0, 6)
+    PyImGui.begin_disabled(_runner_is_running() or _runner_is_paused() or _party_load_tree is not None)
+    if _primary_button("Load using priority", 146):
+        _load_using_priority()
+    PyImGui.end_disabled()
 
 
 def _draw_left_tabs() -> None:
@@ -992,6 +1072,7 @@ def _draw_main_layout() -> None:
 
 
 def _main_impl() -> None:
+    _update_party_load_tree()
     if _runner is not None and _runner.is_running():
         _runner.update()
 
@@ -1005,6 +1086,7 @@ def _main_impl() -> None:
     _draw_top_bar()
     _draw_main_layout()
     PyImGui.end()
+    draw_team_configuration_window(ui_id="modular_tester", title="Modular Team Build")
     _draw_move_path_overlay()
     PyImGui.pop_style_color(theme_colors)
 

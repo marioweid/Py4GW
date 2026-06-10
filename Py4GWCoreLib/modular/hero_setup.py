@@ -21,6 +21,8 @@ from .hero_setup_model import (
     save_hero_priority,
 )
 
+DEFAULT_HENCHMAN_PRIORITY = [5, 6, 1, 3, 2, 4, 7, 8]
+
 _UI_EXPORTS = {
     "draw_configure_teams_section",
     "draw_priority_tab",
@@ -30,6 +32,15 @@ _UI_EXPORTS = {
     "show_team_configuration_window",
     "toggle_team_configuration_window",
 }
+
+
+def get_henchman_priority() -> list[int]:
+    try:
+        from .hero_setup_model import get_henchman_priority as _model_get_henchman_priority
+
+        return list(_model_get_henchman_priority())
+    except Exception:
+        return list(DEFAULT_HENCHMAN_PRIORITY)
 
 
 def __getattr__(name: str):
@@ -43,6 +54,7 @@ def __getattr__(name: str):
 
 __all__ = [
     "DEFAULT_HERO_PRIORITY",
+    "DEFAULT_HENCHMAN_PRIORITY",
     "default_hero_config",
     "default_hero_config_path",
     "draw_configure_teams_section",
@@ -50,6 +62,7 @@ __all__ = [
     "draw_setup_tab",
     "draw_team_configuration_window",
     "get_hero_priority",
+    "get_henchman_priority",
     "get_team_by_priority",
     "hero_config_path",
     "hero_id_from_name",
