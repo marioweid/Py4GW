@@ -17,18 +17,22 @@ from Py4GWCoreLib import (
     Range,
     Routines,
     SharedCommandType,
+    CombatPrepSkillsType,
     AgentArray,
+    AutoPathing,
     IniHandler,
 )
 from Py4GW_widget_manager import get_widget_handler
+from Py4GWCoreLib.py4gwcorelib_src.BehaviorTree import BehaviorTree
+from Py4GWCoreLib.routines_src.BehaviourTrees import BT
 from Py4GWCoreLib.routines_src.Yield import Utils
 from Py4GWCoreLib.routines_src.Yield import Yield
 from Widgets.System.Messaging import get_inventory_count, reset_inventory_count
 
 # ==================== CONFIGURATION ====================
-BOT_NAME = "Bogroot Growths"
+BOT_NAME = "Bogroot Growths Recorded Route"
 MODULE_ICON = "Textures\\Module_Icons\\Bogroot Growths.png"
-MODULE_TAGS = ["Frog Scepter", "BOG", "Frog", "Asura", "Drawf", "Rep"]
+MODULE_TAGS = ["Frog Scepter", "BOG", "Frog", "Asura", "Drawf", "Rep", "Recorded Route"]
 
 # Widgets you want to force-manage at startup.
 # Edit these lists to choose which widgets to enable/disable.
@@ -37,9 +41,14 @@ WIDGETS_TO_ENABLE: tuple[str, ...] = (
     "LootManager",
     "Return to outpost on defeat",
 )
-WIDGETS_TO_DISABLE: tuple[str, ...] = ()
+WIDGETS_TO_DISABLE: tuple[str, ...] = (
+    "InventoryPlus",
+    "Inventory Plus",
+)
 _ALT_ONLY_DISABLE_WIDGETS: tuple[str, ...] = (
     BOT_NAME,
+    "Bogroot Growths",
+    "Frog Farm Modular",
     "Frog Scepter bot",
     "Frog Scepter",
 )
@@ -66,6 +75,9 @@ _save_requested: bool  = False
 # ==================== SETTINGS ====================
 _use_hard_mode:      bool = True
 _randomize_district: bool = True
+_use_precons_running: bool = True
+_use_precons_level1:  bool = True
+_use_precons_level2:  bool = True
 
 _FIXED_ID_KITS_TARGET          = 3
 _FIXED_SALVAGE_KITS_TARGET     = 10
@@ -88,6 +100,16 @@ _MAX_ALT_SETTLE_WAIT_MS        = 5000
 _merchant_alt_wait_ms:                int  = _DEFAULT_ALT_SETTLE_WAIT_MS
 _POST_RETURN_TO_ARBOR_SETTLE_MS = 4000
 _POST_WIDGET_REENABLE_SETTLE_MS = 2500
+_MISSION_MAP_MOVE_TIMEOUT_MS = 60000
+_MISSION_MAP_MOVE_RETRY_WAIT_MS = 500
+_MISSION_MAP_STUCK_RECOVERY_TIMEOUT_MS = 5000
+_MISSION_MAP_STUCK_POST_COMMAND_WAIT_MS = 1000
+_MISSION_MAP_STUCK_RECOVERY_OFFSET = 300.0
+_PRECOMBAT_PREP_COOLDOWN_MS = 15000
+_STUCK_POSITION_SECONDS = 20.0
+_STUCK_POSITION_RADIUS = 250.0
+_STUCK_COMMAND_COOLDOWN_SECONDS = 20.0
+_last_precombat_prep_ms: int = 0
 
 # ==================== FROGGY STATISTICS ====================
 FROGGY_MODEL_IDS    = list(range(1953, 1975))  # all FROGGY variants (domination -> channeling)
@@ -160,6 +182,7 @@ TEKKS_QUEST_REWARD_DIALOG = 0x833907
 # Coordinates
 BOGROOT_CHEST_POSITION = (14982.66, -19122.0)
 TEKKS_POSITION = (12500, 22648)
+BEACON_OF_DROKNAR_ENCODED_NAMES = ((2, 129, 189, 34, 175, 164, 87, 198, 207, 23, 0, 0),)
 
 # ==================== GLOBAL VARIABLES ====================
 bot = Botting(
@@ -169,6 +192,430 @@ bot = Botting(
     upkeep_morale_active=True,
     upkeep_auto_inventory_management_active=True,
 )
+
+
+def _normalize_route_points(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    return [(float(x), float(y)) for x, y in points]
+
+
+def _mission_map_danger_nearby() -> bool:
+    if not Player.IsPlayerLoaded():
+        return False
+    try:
+        px, py = Player.GetXY()
+        enemies = Routines.Agents.GetFilteredEnemyArray(px, py, Range.Earshot.value)
+        return len(enemies) > 0
+    except Exception:
+        return False
+
+
+def _agent_matches_encoded_name(agent_id: int, encoded_names: tuple[tuple[int, ...], ...]) -> bool:
+    try:
+        agent_encoded = tuple(int(value) for value in PyAgent.PyAgent.GetAgentEncName(agent_id))
+    except Exception:
+        return False
+    return agent_encoded in encoded_names
+
+
+def _find_encoded_npc_near_xy(
+    encoded_names: tuple[tuple[int, ...], ...],
+    x: float,
+    y: float,
+    radius: float = 1200.0,
+) -> int:
+    npcs = AgentArray.GetNPCMinipetArray()
+    npcs = AgentArray.Filter.ByDistance(npcs, (float(x), float(y)), radius)
+    npcs = AgentArray.Sort.ByDistance(npcs, (float(x), float(y)))
+    for agent_id in npcs:
+        aid = int(agent_id)
+        if _agent_matches_encoded_name(aid, encoded_names):
+            return aid
+    return 0
+
+
+def _interact_encoded_npc_near_xy(
+    encoded_names: tuple[tuple[int, ...], ...],
+    display_name: str,
+    x: float,
+    y: float,
+    radius: float = 1200.0,
+    timeout_ms: int = 10000,
+) -> Generator[Any, Any, bool]:
+    target_id = _find_encoded_npc_near_xy(encoded_names, x, y, radius)
+    if target_id == 0:
+        ConsoleLog(
+            BOT_NAME,
+            f"{display_name}: no encoded NPC found near ({x:.1f}, {y:.1f}) within {radius:.0f}.",
+            Py4GW.Console.MessageType.Warning,
+        )
+        return False
+
+    Player.ChangeTarget(target_id)
+    yield from Routines.Yield.wait(150)
+    Player.Interact(target_id, False)
+
+    deadline = time.time() + (timeout_ms / 1000.0)
+    while time.time() < deadline:
+        px, py = Player.GetXY()
+        tx, ty = Agent.GetXY(target_id)
+        dx = float(px) - float(tx)
+        dy = float(py) - float(ty)
+        if (dx * dx + dy * dy) <= (220.0 * 220.0):
+            yield from Routines.Yield.wait(500)
+            return True
+        Player.ChangeTarget(target_id)
+        Player.Interact(target_id, False)
+        yield from Routines.Yield.wait(500)
+
+    ConsoleLog(BOT_NAME, f"{display_name}: timeout waiting to reach/interact with encoded NPC.", Py4GW.Console.MessageType.Warning)
+    return False
+
+
+def _send_dialog_to_party_current_target(dialog_id: int, wait_ms: int = 3000) -> Generator:
+    target = Player.GetTargetID()
+    if target == 0:
+        ConsoleLog(BOT_NAME, f"No target selected for dialog {dialog_id}.", Py4GW.Console.MessageType.Warning)
+        return
+
+    sender_email = Player.GetAccountEmail()
+    accounts = GLOBAL_CACHE.ShMem.GetAllAccountData()
+    for account in accounts:
+        account_email = getattr(account, "AccountEmail", "")
+        if not account_email:
+            continue
+        GLOBAL_CACHE.ShMem.SendMessage(
+            sender_email,
+            account_email,
+            SharedCommandType.SendDialogToTarget,
+            (target, dialog_id, 0, 0),
+        )
+    yield from Routines.Yield.wait(wait_ms)
+
+
+def _take_beacon_of_droknar_blessing(x: float, y: float) -> Generator:
+    success = yield from _interact_encoded_npc_near_xy(
+        BEACON_OF_DROKNAR_ENCODED_NAMES,
+        "Beacon of Droknar",
+        x,
+        y,
+    )
+    if not success:
+        # Fallback keeps old behavior if encoded lookup is unavailable for any reason.
+        yield from Routines.Yield.Agents.InteractWithAgentXY(x, y, timeout_ms=10000, tolerance=220.0)
+
+    yield from Routines.Yield.wait(750)
+    Player.SendDialog(DWARVEN_BLESSING_DIALOG)
+    yield from _send_dialog_to_party_current_target(DWARVEN_BLESSING_DIALOG)
+    yield from Routines.Yield.wait(1000)
+    yield
+
+
+def _send_precombat_prep_to_party(reason: str) -> None:
+    """Ask multibox accounts to run the same spirit/shout prep used by CombatPrep."""
+    sender_email = Player.GetAccountEmail()
+    if not sender_email:
+        return
+
+    try:
+        accounts = GLOBAL_CACHE.ShMem.GetAllAccountData()
+    except Exception:
+        accounts = []
+
+    sent = 0
+    for account in accounts:
+        account_email = getattr(account, "AccountEmail", "")
+        if not account_email or account_email == sender_email:
+            continue
+
+        for prep_type in (CombatPrepSkillsType.SpiritsPrep, CombatPrepSkillsType.ShoutsPrep):
+            GLOBAL_CACHE.ShMem.SendMessage(
+                sender_email,
+                account_email,
+                SharedCommandType.UseSkillCombatPrep,
+                (prep_type, 0, 0, 0),
+            )
+        sent += 1
+
+    if sent:
+        ConsoleLog(
+            BOT_NAME,
+            f"[Mission Map Path] Pre-combat prep requested for {sent} account(s): {reason}.",
+            Py4GW.Console.MessageType.Info,
+        )
+
+
+def _maybe_run_precombat_prep(step_name: str) -> None:
+    global _last_precombat_prep_ms
+    now_ms = int(time.time() * 1000)
+    if now_ms - _last_precombat_prep_ms < _PRECOMBAT_PREP_COOLDOWN_MS:
+        return
+    _last_precombat_prep_ms = now_ms
+    _send_precombat_prep_to_party(step_name)
+
+
+def _snap_point_like_mission_map(raw_point: tuple[float, float], step_name: str) -> Generator:
+    """Snap one route target the same way Mission Map+ right-click snap does."""
+    yield from AutoPathing().load_pathing_maps()
+    nav = AutoPathing().get_navmesh()
+
+    point = (float(raw_point[0]), float(raw_point[1]))
+    snapped = nav.find_nearest_reachable(point) if nav else None
+    if snapped is None:
+        ConsoleLog(
+            BOT_NAME,
+            f"[Mission Map Path] {step_name}: using raw point ({point[0]:.1f}, {point[1]:.1f}); navmesh snap unavailable.",
+            Py4GW.Console.MessageType.Warning,
+        )
+        return point
+
+    snapped_point = (float(snapped[0]), float(snapped[1]))
+    if (abs(snapped_point[0] - point[0]) > 1.0) or (abs(snapped_point[1] - point[1]) > 1.0):
+        ConsoleLog(
+            BOT_NAME,
+            f"[Mission Map Path] {step_name}: snapped ({point[0]:.1f}, {point[1]:.1f}) -> ({snapped_point[0]:.1f}, {snapped_point[1]:.1f}).",
+            Py4GW.Console.MessageType.Info,
+        )
+    return snapped_point
+
+
+def _is_player_dead() -> bool:
+    try:
+        return Agent.IsDead(Player.GetAgentID()) or Routines.Checks.Player.IsDead()
+    except Exception:
+        return False
+
+
+def _is_party_alive_for_unstuck() -> bool:
+    try:
+        return not _is_player_dead() and not Routines.Checks.Party.IsPartyMemberDead()
+    except Exception:
+        return not _is_player_dead()
+
+
+def _send_stuck_command_to_party(reason: str) -> None:
+    ConsoleLog(BOT_NAME, f"[Mission Map Path] Stuck detected; sending /stuck ({reason}).", Py4GW.Console.MessageType.Warning)
+    Player.SendChatCommand("stuck")
+
+    sender_email = Player.GetAccountEmail()
+    if not sender_email:
+        return
+
+    try:
+        px, py = Player.GetXY()
+        accounts = GLOBAL_CACHE.ShMem.GetAllAccountData()
+        for account in accounts:
+            account_email = getattr(account, "AccountEmail", "")
+            if not account_email or account_email == sender_email:
+                continue
+            # There is no generic multibox chat-command message handler here; BruteForceUnstuck starts with /stuck
+            # on the receiving account and then attempts light recovery if still blocked.
+            GLOBAL_CACHE.ShMem.SendMessage(
+                sender_email,
+                account_email,
+                SharedCommandType.BruteForceUnstuck,
+                (float(px), float(py), 0, 0),
+            )
+    except Exception as exc:
+        ConsoleLog(BOT_NAME, f"[Mission Map Path] Failed to send multibox /stuck recovery: {exc}", Py4GW.Console.MessageType.Warning)
+
+
+def _wait_for_respawn_position_change(previous_pos: tuple[float, float], step_name: str) -> Generator:
+    """Wait for dungeon-wipe respawn before rebuilding movement from the new current position."""
+    ConsoleLog(
+        BOT_NAME,
+        f"[Mission Map Path] {step_name}: death detected; waiting for respawn before recalculating path.",
+        Py4GW.Console.MessageType.Warning,
+    )
+
+    # Dungeon party wipes take roughly 10s to respawn.  Do not reuse the old
+    # movement tree/path after that; wait until the player is alive and the
+    # shrine moved us to a different position, then build a fresh navmesh path.
+    start = time.time()
+    min_wait_done = False
+    position_changed = False
+    while True:
+        if (time.time() - start) >= 10.0:
+            min_wait_done = True
+
+        current_pos = Player.GetXY()
+        if current_pos:
+            dx = float(current_pos[0]) - float(previous_pos[0])
+            dy = float(current_pos[1]) - float(previous_pos[1])
+            position_changed = (dx * dx + dy * dy) >= (250.0 * 250.0)
+
+        if min_wait_done and not _is_player_dead() and position_changed:
+            ConsoleLog(
+                BOT_NAME,
+                f"[Mission Map Path] {step_name}: respawn confirmed at ({current_pos[0]:.1f}, {current_pos[1]:.1f}); recalculating path.",
+                Py4GW.Console.MessageType.Info,
+            )
+            return
+
+        # Failsafe: if the game reports alive but the position did not change
+        # for an unusually long time, continue anyway with a fresh path from the
+        # current position rather than leaving an old move command active.
+        if (time.time() - start) >= 20.0 and not _is_player_dead():
+            ConsoleLog(
+                BOT_NAME,
+                f"[Mission Map Path] {step_name}: respawn position change was not observed; recalculating path from current position anyway.",
+                Py4GW.Console.MessageType.Warning,
+            )
+            return
+
+        yield from Routines.Yield.wait(250)
+
+
+def _new_mission_map_move_tree(
+    snapped_x: float,
+    snapped_y: float,
+    timeout_ms: int = _MISSION_MAP_MOVE_TIMEOUT_MS,
+) -> BehaviorTree:
+    # One target, autopathing enabled. This matches Mission Map+ right-click
+    # behavior: snap the clicked point to the navmesh, calculate a path from the
+    # player's *current* position, then issue normal Player.Move commands along it.
+    return BT.Movement.Move(snapped_x, snapped_y, timeout_ms=timeout_ms, log=False)
+
+
+def _perpendicular_stuck_recovery_point(
+    current_pos: tuple[float, float],
+    target_pos: tuple[float, float],
+    side: int,
+) -> tuple[float, float] | None:
+    current_x, current_y = float(current_pos[0]), float(current_pos[1])
+    target_x, target_y = float(target_pos[0]), float(target_pos[1])
+    dx = target_x - current_x
+    dy = target_y - current_y
+    distance = math.hypot(dx, dy)
+    if distance < 1.0:
+        return None
+
+    midpoint_x = current_x + dx * 0.5
+    midpoint_y = current_y + dy * 0.5
+    perpendicular_x = -dy / distance * side
+    perpendicular_y = dx / distance * side
+    return (
+        midpoint_x + perpendicular_x * _MISSION_MAP_STUCK_RECOVERY_OFFSET,
+        midpoint_y + perpendicular_y * _MISSION_MAP_STUCK_RECOVERY_OFFSET,
+    )
+
+
+def _run_mission_map_stuck_recovery_detour(raw_point: tuple[float, float], step_name: str) -> Generator:
+    snapped_x, snapped_y = yield from _snap_point_like_mission_map(raw_point, f"{step_name} stuck recovery")
+    move_tree = _new_mission_map_move_tree(
+        snapped_x,
+        snapped_y,
+        timeout_ms=_MISSION_MAP_STUCK_RECOVERY_TIMEOUT_MS,
+    )
+    start = time.time()
+    while (time.time() - start) * 1000 < _MISSION_MAP_STUCK_RECOVERY_TIMEOUT_MS:
+        state = BehaviorTree.Node._normalize_state(move_tree.tick())
+        if state == BT.NodeState.SUCCESS:
+            return True
+        if state == BT.NodeState.FAILURE:
+            return False
+        yield from Routines.Yield.wait(100)
+    return False
+
+
+def _run_mission_map_move_to(raw_point: tuple[float, float], step_name: str) -> Generator:
+    snapped_x, snapped_y = yield from _snap_point_like_mission_map(raw_point, step_name)
+    move_tree = _new_mission_map_move_tree(snapped_x, snapped_y)
+    retry_count = 0
+    stuck_anchor_pos = Player.GetXY()
+    stuck_anchor_time = time.time()
+    last_stuck_command_time = 0.0
+    stuck_recovery_side = 1
+    while True:
+        if _is_player_dead():
+            death_pos = Player.GetXY()
+            yield from _wait_for_respawn_position_change((float(death_pos[0]), float(death_pos[1])), step_name)
+            move_tree = _new_mission_map_move_tree(snapped_x, snapped_y)
+            retry_count = 0
+            stuck_anchor_pos = Player.GetXY()
+            stuck_anchor_time = time.time()
+            last_stuck_command_time = 0.0
+
+        current_pos = Player.GetXY()
+        moved_dx = float(current_pos[0]) - float(stuck_anchor_pos[0])
+        moved_dy = float(current_pos[1]) - float(stuck_anchor_pos[1])
+        now = time.time()
+        if (moved_dx * moved_dx + moved_dy * moved_dy) > (_STUCK_POSITION_RADIUS * _STUCK_POSITION_RADIUS):
+            stuck_anchor_pos = current_pos
+            stuck_anchor_time = now
+        elif (
+            (now - stuck_anchor_time) >= _STUCK_POSITION_SECONDS
+            and (now - last_stuck_command_time) >= _STUCK_COMMAND_COOLDOWN_SECONDS
+            and _is_party_alive_for_unstuck()
+        ):
+            _send_stuck_command_to_party(
+                f"{step_name}; no position change > {_STUCK_POSITION_RADIUS:.0f} for {_STUCK_POSITION_SECONDS:.0f}s"
+            )
+            last_stuck_command_time = now
+            yield from Routines.Yield.wait(_MISSION_MAP_STUCK_POST_COMMAND_WAIT_MS)
+
+            current_pos = Player.GetXY()
+            recovery_point = _perpendicular_stuck_recovery_point(
+                (float(current_pos[0]), float(current_pos[1])),
+                (snapped_x, snapped_y),
+                stuck_recovery_side,
+            )
+            stuck_recovery_side *= -1
+            if recovery_point:
+                ConsoleLog(
+                    BOT_NAME,
+                    f"[Mission Map Path] {step_name}: trying stuck recovery detour "
+                    f"({recovery_point[0]:.1f}, {recovery_point[1]:.1f}) before retrying original target.",
+                    Py4GW.Console.MessageType.Info,
+                )
+                yield from _run_mission_map_stuck_recovery_detour(recovery_point, step_name)
+
+            move_tree = _new_mission_map_move_tree(snapped_x, snapped_y)
+            stuck_anchor_pos = Player.GetXY()
+            stuck_anchor_time = time.time()
+            continue
+
+        pause_for_danger = _mission_map_danger_nearby()
+        if pause_for_danger:
+            _maybe_run_precombat_prep(step_name)
+
+        move_tree.blackboard["PAUSE_MOVEMENT"] = pause_for_danger
+        state = BehaviorTree.Node._normalize_state(move_tree.tick())
+        if state == BT.NodeState.SUCCESS:
+            yield
+            return
+        if state == BT.NodeState.FAILURE:
+            retry_count += 1
+            current_pos = Player.GetXY()
+            ConsoleLog(
+                BOT_NAME,
+                f"[Mission Map Path] {step_name}: movement failed at ({raw_point[0]:.1f}, {raw_point[1]:.1f}); "
+                f"retry {retry_count} from ({current_pos[0]:.1f}, {current_pos[1]:.1f}) with a fresh navmesh path.",
+                Py4GW.Console.MessageType.Warning,
+            )
+            Player.Move(current_pos[0], current_pos[1])
+            yield from Routines.Yield.wait(_MISSION_MAP_MOVE_RETRY_WAIT_MS)
+            move_tree = _new_mission_map_move_tree(snapped_x, snapped_y)
+            stuck_anchor_pos = Player.GetXY()
+            stuck_anchor_time = time.time()
+            continue
+        yield from Routines.Yield.wait(100)
+
+
+def AddMissionMapPath(
+    points: list[tuple[float, float]],
+    step_name: str,
+) -> None:
+    route = _normalize_route_points(points)
+    if not route:
+        bot.States.AddCustomState(_step_anchor, f"{step_name} (empty route)")
+        return
+
+    def _movement_state() -> Generator:
+        total = len(route)
+        for index, point in enumerate(route, start=1):
+            yield from _run_mission_map_move_to(point, f"{step_name} {index}/{total}")
+
+    bot.States.AddCustomState(_movement_state, step_name)
 
 # ==================== CORE ROUTINE ====================
 def farm_froggy_routine(bot: Botting) -> None:
@@ -207,63 +654,62 @@ def farm_froggy_routine(bot: Botting) -> None:
     bot.Party.SetHardMode(_use_hard_mode)
     # Enable properties
     bot.Properties.Enable('hero_ai')
+    bot.States.AddCustomState(_force_leader_hero_ai_combat, "Force leader HeroAI combat on")
     bot.States.AddCustomState(_step_anchor, "Reset farm")  # anchor for secure return on wipe    
     # ===== GO TO DUNGEON =====
     bot.Quest.AbandonQuest(TEKKS_QUEST_ID)
     bot.States.AddHeader("Go to Dungeon")
+    bot.States.AddCustomState(lambda: _set_dungeon_looting(False, "running to dungeon"), "Disable looting while running to dungeon")
     bot.Templates.Aggressive()
     bot.Move.XYAndExitMap(-9451.37, -19766.40, target_map_id=SPARKFLY)
     bot.Wait.UntilOnExplorable()
  
  
-    # First blessing in Arbor Bay
-    bot.Move.XYAndInteractNPC(-8950.0, -19843.0)
+    # First blessing immediately after zoning into Sparkfly.
+    AddMissionMapPath([(-8950.0, -19843.0)], "Recorded route - Sparkfly blessing approach")
+    bot.Interact.WithNpcAtXY(-8950.0, -19843.0)
     bot.Multibox.SendDialogToTarget(DWARVEN_BLESSING_DIALOG)
     bot.Wait.ForTime(4000)
-    bot.Multibox.UseAllConsumables()
+    bot.States.AddCustomState(lambda: _use_precons_if_enabled("running", "after Sparkfly blessing"), "Use precons after Sparkfly blessing")
 
-    # Path to tekks
+    # Recorded route to Tekks. Movement is executed like Mission Map+ right-click snap.
     path = [
-    (-8933.0, -18909.0),
-    (-10361.0, -16332.0),
-    (-11211.0, -13459.0),
-    (-10755.0, -10552.0),
-    (-9544.0, -7814.0),
-    (-7662.0, -5532.0),
-    (-6185.0, -4182.0),
-    (-4742.0, -2793.0),
-    (-2150.0, -1301.0),
-    (71.0, 733.0),
-    (1480.0, 3385.0),
-    (2928.0, 4790.0),
-    (4280.0, 6273.0),
-    (5420.0, 7923.0),
-    (6912.62, 8937.64),
-    (7771.0, 11123.0),
-    (8968.0, 12699.0),
-    (10876.0, 13304.0),
-    (12481.0, 14496.0),
-    (13080.0, 16405.0),
-    (13487.0, 18372.0),
-    (13476.0, 20370.0),
-    (12503.0, 22721.0)
+    (-10787.0, -12984.0),
+    (-7978.0, -11380.0),
+    (-6779.0, -8893.0),
+    (-4725.0, -5677.0),
+    (-3590.0, -2898.0),
+    (-349.0, 1100.0),
+    (-313.0, 5633.0),
+    (3682.0, 9598.0),
+    (4888.0, 10325.0),
+    (6348.0, 12176.0),
+    (10731.0, 18283.0),
+    (11540.0, 18946.0),
+    (12404.0, 21935.0),
 ]
-    bot.Move.FollowAutoPath(path)
+    AddMissionMapPath(path, "Recorded route - Sparkfly to Tekks")
     bot.Wait.UntilOutOfCombat()
     
     # ===== LOOP RESTART POINT =====
     bot.States.AddCustomState(loop_marker, "LOOP_RESTART_POINT")
 
-    # Walk to tekks first (pathfinding), then interact if needed
-    bot.Move.XY(12500, 22648)
+    # Walk to tekks first with Mission Map style pathing, then interact if needed.
+    AddMissionMapPath([(12500.0, 22648.0)], "Recorded route - final Tekks approach")
     bot.States.AddCustomState(lambda: _handle_tekks(bot), "tekks Quest Handler")
 
-    # Enter the dungeon
-    bot.Move.XY(11676.01, 22685.0)
-    bot.Move.XY(11562.77, 24059.0)
-    bot.Move.XY(13097.0, 26393.0)
+    # Enter the dungeon using the same Mission Map style movement.
+    AddMissionMapPath(
+        [
+            (11676.01, 22685.0),
+            (11562.77, 24059.0),
+            (13097.0, 26393.0),
+        ],
+        "Recorded route - Tekks to dungeon portal",
+    )
 
     bot.Wait.ForMapToChange(target_map_id=BOGROOT_L1)
+    bot.States.AddCustomState(lambda: _set_dungeon_looting(True, "inside dungeon"), "Enable looting for dungeon levels")
     
 
     # =========================
@@ -278,13 +724,10 @@ def farm_froggy_routine(bot: Botting) -> None:
 
     # First blessing Level 1
     bot.States.AddCustomState(lambda: S_WhitelistModels(BOSS_KEY_MODEL_IDS), "Whitelist Boss Key")
-    bot.Multibox.UseAllConsumables()
-    bot.Move.XY(18092.0, 4315.0)
+    bot.States.AddCustomState(lambda: _use_precons_if_enabled("level1", "before Level 1 blessing"), "Use precons before L1 blessing")
+    AddMissionMapPath([(19004.0, 7771.0)], "Recorded route - Level 1 blessing approach")
     bot.Wait.UntilOutOfCombat()
-    bot.Move.XY(19045.95, 7877.0)
-    bot.Move.XYAndInteractNPC(19045.95, 7877.0)
-    bot.Wait.ForTime(2000)    
-    bot.Multibox.SendDialogToTarget(DWARVEN_BLESSING_DIALOG)    
+    bot.States.AddCustomState(lambda: _take_beacon_of_droknar_blessing(19004.0, 7771.0), "Take Beacon of Droknar Blessing")
 
     bot.States.AddHeader("Level 1 - Secure Return Checkpoint 1")
     bot.States.AddCustomState(_step_anchor, "Secure return - L1")
@@ -294,52 +737,37 @@ def farm_froggy_routine(bot: Botting) -> None:
     bot.Templates.Aggressive()
 
     path_1 = [
-    (16541.48, 8558.94),
-    (13038.90, 7792.40),
-    (11666.15, 6464.53),
-    (10030.42, 7026.09),
-    (9752.17, 8241.79),
-    (8238.36, 7434.97),
-    (6491.41, 5310.56),]
+    (16391.0, 8670.0),
+    (11635.0, 6416.0),
+    (9627.0, 7246.0),
+    (6829.0, 5528.0),
+    (4976.0, 1977.0),
+    ]
     bot.Templates.Aggressive()
     bot.Wait.UntilOutOfCombat()
-    bot.Move.FollowAutoPath(path_1)
+    AddMissionMapPath(path_1, "Recorded route - Level 1 first segment")
 
     bot.States.AddHeader("Level 1 - Secure Return Checkpoint 2")
     bot.States.AddCustomState(_step_anchor, "Secure return 2 - L1")
+    bot.States.AddCustomState(lambda: _take_beacon_of_droknar_blessing(4976.0, 1977.0), "Take Beacon of Droknar Blessing - L1 Mid")
 
     path_2= [
-    (5097.64, 2204.33),
-    (1228.15, 54.49),
-    (-140.87, 2741.86),
-    (1228.15, 54.49),
-    (141.23, -1965.14)
-        ]
+    (2359.0, -1466.0),
+    (334.0, -1982.0),
+    (-896.0, -4092.0),
+    (-1289.0, -6259.0),
+    (169.0, -8898.0),
+    (1541.0, -10821.0),
+    (1466.0, -14779.0),
+    (7251.0, -17270.0),
+    (7865.0, -19350.0),
+    ]
     bot.Templates.Aggressive()
-    bot.Move.FollowAutoPath(path_2)
+    AddMissionMapPath(path_2, "Recorded route - Level 1 second segment to exit")
     bot.Wait.UntilOutOfCombat()
 
     bot.States.AddHeader("Level 1 - Secure Return Checkpoint 3")
     bot.States.AddCustomState(_step_anchor, "Secure return 3 - L1")
-    
-    path_3 = [    
-    (-1540.98, -5820.18),
-    (-269.32, -8533.17),
-    (-1230.10, -8608.68),
-    (853.90, -9041.68),
-    (1868.0, -10647.0),
-    (1645.0, -11810.0),
-    (1604.90, -12033.70),
-    (1579.39, -14311.38),
-    (7319.99, -17202.99),
-    (8450.01, -16460.50),
-    (7356.56, -18272.24),
-    (7865.0, -19350.0),
-    ]
-
-    bot.Templates.Aggressive()
-    bot.Move.FollowAutoPath(path_3)
-    bot.Wait.UntilOutOfCombat()
 
     bot.Wait.ForMapToChange(target_map_name="Bogroot Growths (level 2)")
     bot.States.AddCustomState(_mark_l2_start, "Mark L2 Start")
@@ -350,117 +778,87 @@ def farm_froggy_routine(bot: Botting) -> None:
     # =========================
 
     bot.States.AddHeader("Level 2 - Entry and Blessing")
-    # --- Entry + Blessing ---
-    bot.Move.XY(-11055.0, -5551.0)
-    bot.Move.XYAndInteractNPC(-11055.0, -5551.0)
-    bot.Multibox.SendDialogToTarget(DWARVEN_BLESSING_DIALOG)
-    bot.Wait.ForTime(2000)
+    AddMissionMapPath([(-11055.0, -5551.0)], "Recorded route - Level 2 entry blessing approach")
+    bot.States.AddCustomState(lambda: _take_beacon_of_droknar_blessing(-11055.0, -5551.0), "Take Beacon of Droknar Blessing - L2 Entry")
     bot.States.AddHeader("Level 2 - Secure Return Checkpoint")
-    bot.States.AddCustomState(_step_anchor, "Secure return - L2")  # anchor for secure return on wipe
+    bot.States.AddCustomState(_step_anchor, "Secure return - L2")
     bot.States.AddCustomState(_reset_l2_boss_route_flag, "Reset L2 boss route flag")
-    # Use consumables
     bot.States.AddCustomState(UseSummons, "Use Summons")
-    bot.Multibox.UseAllConsumables()
+    bot.States.AddCustomState(lambda: _use_precons_if_enabled("level2", "after Level 2 blessing"), "Use precons after L2 blessing")
     bot.Templates.Aggressive()
-    # --- Path to torch area (atomisÃ©) ---
+
     path_4 = [
-    (-11321.0, -5033.0),
-    (-11268.0, -3922.0),
-    (-11187.0, -2190.0),
-    (-10706.0, -1272.0),
-    (-10535.0, -191.0),
-    (-10262.0, -1167.0),
-    (-9390.0, -393.0),
-    (-8427.0, 1043.0),
-    (-7297.0, 2371.0),
-    (-6460.0, 2964.0),
-    (-5173.0, 3621.0),
-    (-4225.0, 4452.0),
-    (-3405.0, 5274.0),
-    (-2778.0, 6814.0),
-    (-3725.0, 7823.0),
-    (-3627.0, 8933.0),
-    (-3014.0, 10554.0),
-    (-1604.0, 11789.0),
-    (-955.0, 10984.0),
+        (-11147.0, -3052.0),
+        (-11340.0, -1168.0),
+        (-8825.0, 463.0),
+        (-7128.0, 2972.0),
+        (-5332.0, 3461.0),
+        (-3847.0, 5041.0),
+        (-2700.0, 5869.0),
+        (-2815.0, 7132.0),
+        (-2454.0, 8168.0),
+        (-1220.0, 8012.0),
+        (24.0, 9942.0),
+        (-592.0, 11206.0),
     ]
-    bot.Templates.Aggressive()
-    bot.Move.FollowAutoPath(path_4)
+    AddMissionMapPath(path_4, "Recorded route - Level 2 first route")
     bot.Wait.UntilOutOfCombat()
 
-    bot.Move.XYAndInteractNPC(-955.0, 10984.0)
-    bot.Multibox.SendDialogToTarget(DWARVEN_BLESSING_DIALOG)
-    bot.Wait.ForTime(4000)
+    bot.States.AddCustomState(lambda: _take_beacon_of_droknar_blessing(-592.0, 11206.0), "Take Beacon of Droknar Blessing - L2 Mid")
 
     bot.States.AddHeader("Level 2 - Secure Return Checkpoint 2")
     bot.States.AddCustomState(_step_anchor, "Secure return 2 - L2")
 
     path_5 = [
-    (216.0, 11534.0),
-    (1485.0, 12022.0),
-    (2690.0, 12615.0),
-    (3343.0, 13721.0),
-    (4693.0, 13577.0),
-    (5693.0, 12927.0),
-    (5942.0, 11067.0),
-    (6878.0, 9657.0),
-    (8100.54, 8544.52),
-    (8725.26, 7115.42),
-    (9234.03, 6843.0),
-    (8591.0, 4285.0),
-]
+        (-592.0, 11206.0),
+        (2989.0, 12488.0),
+        (3302.0, 13813.0),
+        (6023.0, 13663.0),
+        (5610.0, 11695.0),
+        (7060.0, 9799.0),
+        (8347.0, 5300.0),
+        (8391.0, 4016.0),
+    ]
     bot.Templates.Aggressive()
-    bot.Move.FollowAutoPath(path_5)
+    AddMissionMapPath(path_5, "Recorded route - Level 2 second route")
     bot.Wait.UntilOutOfCombat()
 
-    bot.Move.XYAndInteractNPC(8591.0, 4285.0)
-    bot.Multibox.SendDialogToTarget(DWARVEN_BLESSING_DIALOG)
-    bot.Wait.ForTime(4000)
+    bot.States.AddCustomState(lambda: _take_beacon_of_droknar_blessing(8391.0, 4016.0), "Take Beacon of Droknar Blessing - L2 Upper")
 
     bot.States.AddHeader("Level 2 - Secure Return Checkpoint 3")
     bot.States.AddCustomState(_step_anchor, "Secure return 3 - L2")
 
-    path_6= [
-    (8372.0, 3448.0),
-    (8714.0, 2151.0),
-    (9268.0, 1261.0),
-    (10207.0, -201.0),
-    (10999.0, -1356.0),
-    (10593.0, -2846.0),
-    (10280.0, -4144.0),
-    (11016.0, -5384.0),
-    (12943.0, -6511.0),
-    (15127.0, -6231.0),
-    (16461.0, -6041.0),
-    (16389.50, -4090.36),
-    (15309.36, -2904.08),
-    (14357.81, -5818.01),
-    (16461.0, -6041.0),]
-
+    path_6 = [
+        (8391.0, 4016.0),
+        (8355.0, 981.0),
+        (10684.0, -3134.0),
+        (10819.0, -5150.0),
+        (12219.0, -6362.0),
+        (17406.0, -6165.0),
+    ]
     bot.Templates.Aggressive()
-    bot.Move.FollowAutoPath(path_6)
+    AddMissionMapPath(path_6, "Recorded route - Level 2 boss lock approach")
     bot.Wait.UntilOutOfCombat()
 
     bot.States.AddHeader("Open Boss Door")
-    bot.Move.XY(17867.55, -6250.63)
-    bot.States.AddCustomState(bot.Move.XYAndInteractGadget(17867.55, -6250.63), "Open Door")
+    bot.Interact.WithGadgetAtXY(17867.55, -6250.63, "Open Door")
+
+    bot.States.AddHeader("Level 2 - Door Checkpoint")
+    bot.States.AddCustomState(_step_anchor, "Secure return - L2 door")
 
     path_7 = [
-    (17623.87, -6546.0),
-    (18024.0, -9191.0),
-    (17110.0, -9842.0),
-    (15867.0, -10866.0),
-    (17555.0, -11963.0),
-    (18761.0, -12747.0),
-    (19619.0, -11498.0),
-]
+        (17406.0, -6165.0),
+        (18272.0, -8327.0),
+        (17899.0, -9402.0),
+        (16299.0, -10595.0),
+        (16990.0, -11840.0),
+        (19130.0, -12233.0),
+    ]
     bot.Templates.Aggressive()
-    bot.Move.FollowAutoPath(path_7)
+    AddMissionMapPath(path_7, "Recorded route - Level 2 boss blessing approach")
     bot.Wait.UntilOutOfCombat()
-    
-    bot.Move.XYAndInteractNPC(19619.0, -11498.0)
-    bot.Multibox.SendDialogToTarget(DWARVEN_BLESSING_DIALOG)
-    bot.Wait.ForTime(4000)
+
+    bot.States.AddCustomState(lambda: _take_beacon_of_droknar_blessing(19130.0, -12233.0), "Take Beacon of Droknar Blessing - Before Boss")
 
     bot.States.AddHeader("Level 2 - Boss Checkpoint")
     bot.States.AddCustomState(_step_anchor, "Secure return - Boss")
@@ -468,26 +866,21 @@ def farm_froggy_routine(bot: Botting) -> None:
 
     bot.States.AddHeader("Level 2 - Path to Boss")
 
-    # --- Boss path ---
     path_froggy = [
-    (17582.52, -14231.0),
-    (14794.47, -14929.0),
-    (13609.12, -17286.0),
-    (14079.80, -17776.0),
-    (15116.40, -18733.0),
-    (16017.74, -19040.79),]
-
+        (19130.0, -12233.0),
+        (17800.0, -14121.0),
+        (14588.0, -15174.0),
+        (15579.0, -19111.0),
+    ]
     bot.Templates.Aggressive()
-    bot.Move.FollowAutoPath(path_froggy)
+    AddMissionMapPath(path_froggy, "Recorded route - Level 2 boss and chest approach")
     bot.States.AddCustomState(_record_run_end, "Record Run End")
     bot.States.AddHeader("Final Chest")
 
-        # ===== OPEN FINAL CHEST =====
-
-    bot.Move.XY(14982.66, -19122.0)
+    AddMissionMapPath([BOGROOT_CHEST_POSITION], "Recorded route - final chest approach")
     bot.States.AddCustomState(open_BOGROOT_chest, "Open Chest (All Accounts)")
     bot.States.AddCustomState(_record_drops_after_loot, "Record Drop Stats After Loot")
-    bot.Move.XY(14079.80, -17776.0)
+    AddMissionMapPath([(15018.0, -17666.0)], "Recorded route - chest to quest reward")
     bot.States.AddCustomState(lambda: _collect_tekks_reward_in_dungeon(bot), "Collect Quest Reward (in dungeon)")
     # ===== NEXT RUN =====
     bot.Wait.ForMapToChange(target_map_name="Sparkfly Swamp")
@@ -748,33 +1141,128 @@ def _coro_sell_scrolls(mx: float, my: float) -> Generator:
     yield from Routines.Yield.wait(300)
 
 
+def _merchant_rules_widget_enabled() -> bool:
+    widget_handler = get_widget_handler()
+    for widget_name in ("Merchant Rules", "MerchantRules"):
+        try:
+            if widget_handler.is_widget_enabled(widget_name):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _get_merchant_rules_widget_instance():
+    widget_handler = get_widget_handler()
+    for widget_name in ("Merchant Rules", "MerchantRules"):
+        widget_info = widget_handler.get_widget_info(widget_name)
+        if not widget_info or not getattr(widget_info, "enabled", False):
+            continue
+        widget_instance = getattr(getattr(widget_info, "module", None), "WIDGET_INSTANCE", None)
+        if widget_instance is not None:
+            return widget_instance
+    return None
+
+
+def _run_merchant_rules_execute_here(stage_name: str = "GH merchant") -> Generator[Any, Any, bool]:
+    """Run Merchant Rules if the widget is enabled; returns True when we attempted it."""
+    if not _merchant_rules_widget_enabled():
+        return False
+
+    request_id = f"froggy-{int(time.time() * 1000)}"
+    my_email = Player.GetAccountEmail()
+    refs: list[tuple[str, int]] = []
+    for acc in GLOBAL_CACHE.ShMem.GetAllAccountData():
+        account_email = getattr(acc, "AccountEmail", "")
+        if not account_email or account_email == my_email:
+            continue
+        msg_index = int(
+            GLOBAL_CACHE.ShMem.SendMessage(
+                my_email,
+                account_email,
+                SharedCommandType.MerchantRules,
+                (3.0, 0.0, 0.0, 0.0),  # Merchant Rules execute opcode
+                (request_id, f"{stage_name} execute", "", ""),
+            )
+        )
+        if msg_index >= 0:
+            refs.append((account_email, msg_index))
+
+    widget = _get_merchant_rules_widget_instance()
+    if widget is not None and callable(getattr(widget, "_execute_now", None)):
+        ConsoleLog(BOT_NAME, "[Merchant] Merchant Rules enabled — executing rules for leader/alts.", Py4GW.Console.MessageType.Info)
+        yield from widget._execute_now(local_only=True, exclude_consumable_crafter=True)
+    else:
+        ConsoleLog(BOT_NAME, "[Merchant] Merchant Rules enabled but widget instance unavailable for leader.", Py4GW.Console.MessageType.Warning)
+
+    deadline = time.monotonic() + 60.0
+    pending = {(email, idx): None for email, idx in refs}
+    while pending and time.monotonic() < deadline:
+        completed: list[tuple[str, int]] = []
+        for account_email, msg_index in list(pending.keys()):
+            message = GLOBAL_CACHE.ShMem.GetInbox(msg_index)
+            is_same_message = (
+                bool(getattr(message, "Active", False))
+                and str(getattr(message, "ReceiverEmail", "") or "") == account_email
+                and str(getattr(message, "SenderEmail", "") or "") == my_email
+                and int(getattr(message, "Command", -1)) == int(SharedCommandType.MerchantRules)
+            )
+            if not is_same_message:
+                completed.append((account_email, msg_index))
+        for key in completed:
+            pending.pop(key, None)
+        if pending:
+            yield from Routines.Yield.wait(100)
+
+    if pending:
+        pending_accounts = ", ".join(sorted({email for email, _ in pending}))
+        ConsoleLog(BOT_NAME, f"[Merchant] Merchant Rules timeout for: {pending_accounts}", Py4GW.Console.MessageType.Warning)
+
+    return True
+
+
 def _coro_sell_nonsalvageable_golds(mx: float, my: float) -> Generator:
-    """Sell all identified, non-salvageable gold items (e.g. anniversary weapons) to the GH merchant."""
+    """Identify and sell all non-FROGGY gold items to the GH merchant."""
     bag_list = GLOBAL_CACHE.ItemArray.CreateBagList(1, 2, 3, 4)
     item_array = GLOBAL_CACHE.ItemArray.GetItemArray(bag_list)
-    sell_ids = []
+
+    gold_ids: list[int] = []
+    unid_gold_ids: list[int] = []
     for item_id in item_array:
+        model_id = int(GLOBAL_CACHE.Item.GetModelID(item_id))
+        if model_id in FROGGY_MODEL_IDS:
+            continue
         _, rarity = GLOBAL_CACHE.Item.Rarity.GetRarity(item_id)
         if rarity != "Gold":
             continue
+        gold_ids.append(int(item_id))
         if not GLOBAL_CACHE.Item.Usage.IsIdentified(item_id):
-            continue
-        if GLOBAL_CACHE.Item.Usage.IsSalvageable(item_id):
-            continue
-        sell_ids.append(int(item_id))
+            unid_gold_ids.append(int(item_id))
+
+    if unid_gold_ids:
+        ConsoleLog(BOT_NAME, f"[Merchant] Identifying {len(unid_gold_ids)} gold item(s) before selling")
+        yield from Routines.Yield.Items.IdentifyItems(unid_gold_ids, log=True)
+        yield from Routines.Yield.wait(500)
+
+    sell_ids = [
+        int(item_id)
+        for item_id in gold_ids
+        if GLOBAL_CACHE.Item.Usage.IsIdentified(item_id)
+        and int(GLOBAL_CACHE.Item.GetModelID(item_id)) not in FROGGY_MODEL_IDS
+    ]
     if not sell_ids:
-        ConsoleLog(BOT_NAME, "[Merchant] No non-salvageable gold items to sell")
+        ConsoleLog(BOT_NAME, "[Merchant] No identified non-FROGGY gold items to sell")
         yield
         return
-    yield from bot.Move._coro_xy_and_interact_npc(mx, my, "GH Merchant (non-salvageable golds)")
+    yield from bot.Move._coro_xy_and_interact_npc(mx, my, "GH Merchant (gold items)")
     yield from Routines.Yield.wait(1200)
-    ConsoleLog(BOT_NAME, f"[Merchant] Selling {len(sell_ids)} non-salvageable gold item(s) at merchant")
+    ConsoleLog(BOT_NAME, f"[Merchant] Selling {len(sell_ids)} non-FROGGY gold item(s) at merchant")
     yield from Routines.Yield.Merchant.SellItems(sell_ids, log=True)
     yield from Routines.Yield.wait(300)
 
 
-_MERCHANT_MANAGED_WIDGETS = ("InventoryPlus",)
-_PRETRAVEL_DISABLE_WIDGETS = ("InventoryPlus",)  # disable before GH travel so deposit cycle doesn't run on GH entry
+_MERCHANT_MANAGED_WIDGETS = ("InventoryPlus", "Inventory Plus")
+_PRETRAVEL_DISABLE_WIDGETS = _MERCHANT_MANAGED_WIDGETS  # always disabled while this bot is running
 
 
 def _disable_merchant_widgets() -> Generator:
@@ -1072,54 +1560,8 @@ def _disable_inventoryplus_pretravel() -> Generator:
 
 
 def _reenable_merchant_widgets() -> Generator:
-    """Re-enable InventoryPlus on leader + all alts after GH merchant ops.
-    Called once all accounts are back in Vlox's Falls, ready to enter the dungeon."""
-    from Py4GWCoreLib.py4gwcorelib_src.WidgetManager import get_widget_handler as _get_wh
-    ConsoleLog(BOT_NAME, "[Merchant] Re-enabling managed widgets on all accounts")
-
-    # Enable on leader immediately
-    wh = _get_wh()
-    for name in _MERCHANT_MANAGED_WIDGETS:
-        wh.enable_widget(name)
-
-    # Send EnableWidget to each alt for each widget, collecting message refs
-    _my_email = Player.GetAccountEmail()
-    _refs: list[tuple[str, int]] = []
-    for acc in GLOBAL_CACHE.ShMem.GetAllAccountData():
-        if acc.AccountEmail != _my_email:
-            for name in _MERCHANT_MANAGED_WIDGETS:
-                msg_index = int(GLOBAL_CACHE.ShMem.SendMessage(
-                    _my_email, acc.AccountEmail,
-                    SharedCommandType.EnableWidget, (0, 0, 0, 0), (name, "", "", ""),
-                ))
-                if msg_index >= 0:
-                    _refs.append((acc.AccountEmail, msg_index))
-
-    # Wait for every alt to call MarkMessageAsFinished (sets Active=False)
-    ConsoleLog(BOT_NAME, f"[Merchant] Waiting for {len(_refs)} EnableWidget message(s) to complete")
-    _pending = {(email, idx): None for email, idx in _refs}
-    _deadline = time.time() + 15.0
-    while _pending and time.time() < _deadline:
-        for _key in list(_pending):
-            _email, _idx = _key
-            _msg = GLOBAL_CACHE.ShMem.GetInbox(_idx)
-            _still_active = (
-                bool(getattr(_msg, "Active", False))
-                and str(getattr(_msg, "ReceiverEmail", "") or "") == _email
-                and str(getattr(_msg, "SenderEmail", "") or "") == _my_email
-                and int(getattr(_msg, "Command", -1)) == int(SharedCommandType.EnableWidget)
-            )
-            if not _still_active:
-                _pending.pop(_key, None)
-        if _pending:
-            yield from Routines.Yield.wait(100)
-
-    if _pending:
-        ConsoleLog(BOT_NAME, f"[Merchant] EnableWidget timeout — {len(_pending)} message(s) unconfirmed. Proceeding.", Py4GW.Console.MessageType.Warning)
-        yield from Routines.Yield.wait(_POST_WIDGET_REENABLE_SETTLE_MS)
-    else:
-        ConsoleLog(BOT_NAME, "[Merchant] All widgets successfully re-enabled on all accounts")
-    yield
+    """Historical hook name; InventoryPlus must remain disabled while this bot runs."""
+    yield from _disable_merchant_widgets()
 
 
 def _gh_merchant_setup(leave_party: bool = True) -> Generator:
@@ -1270,8 +1712,20 @@ def _gh_merchant_setup(leave_party: bool = True) -> Generator:
     mat_xy        = _find_npc_xy_by_name("Material Trader") if _merchant_sell_materials else None
     rare_xy       = _find_npc_xy_by_name("Rare") if (_merchant_buy_ectos or _merchant_sell_rare_mats) else None
 
+    merchant_rules_ran = yield from _run_merchant_rules_execute_here("Froggy GH merchant")
+    if not merchant_rules_ran:
+        ConsoleLog(
+            BOT_NAME,
+            "[Merchant] Merchant Rules is not enabled/available; skipping all sell/salvage/storage cleanup and only restocking kits.",
+            Py4GW.Console.MessageType.Warning,
+        )
+
+    # Item selling/salvage/storage cleanup is intentionally owned by Merchant Rules only.
+    # The Frog bot keeps only GH travel + kit restock here.
+    custom_cleanup_enabled = False
+
     # —— Step 2.5: Store consumable crafting mats before trader sales (leader + alts)
-    if _merchant_store_consumable_materials:
+    if custom_cleanup_enabled and _merchant_store_consumable_materials:
         ConsoleLog(BOT_NAME, "[Merchant] Depositing consumable crafting materials to storage on all accounts")
         deposit_refs = _dispatch_to_alts(
             SharedCommandType.MerchantMaterials,
@@ -1282,7 +1736,7 @@ def _gh_merchant_setup(leave_party: bool = True) -> Generator:
         yield from _wait_for_alt_dispatch_completion("deposit_materials", deposit_refs, SharedCommandType.MerchantMaterials)
 
     # —— Step 3: Sell materials at trader (leader + alts) —————————————————————
-    if _merchant_sell_materials:
+    if custom_cleanup_enabled and _merchant_sell_materials:
         if mat_xy:
             tmx, tmy = mat_xy
             ConsoleLog(BOT_NAME, f"[Merchant] Dispatching sell_materials to alts, trader at ({tmx:.0f}, {tmy:.0f})")
@@ -1319,8 +1773,8 @@ def _gh_merchant_setup(leave_party: bool = True) -> Generator:
                 SharedCommandType.MerchantMaterials,
             )
 
-    # —— Step 5: Sell non-salvageable gold items (anniversary weapons) to merchant —
-    if merchant_xy:
+    # —— Step 5: Legacy gold selling disabled; Merchant Rules owns sell/keep/salvage logic. ——
+    if custom_cleanup_enabled and merchant_xy:
         mx, my = merchant_xy
         ConsoleLog(BOT_NAME, "[Merchant] Dispatching sell_nonsalvageable_golds to alts")
         sell_gold_refs = _dispatch_to_alts(
@@ -1335,8 +1789,8 @@ def _gh_merchant_setup(leave_party: bool = True) -> Generator:
             SharedCommandType.MerchantMaterials,
         )
 
-    # —— Step 6: Sell XP/insight scrolls to merchant (leader + alts) ——————————
-    if merchant_xy:
+    # —— Step 6: Legacy scroll selling disabled; Merchant Rules owns sell/keep/salvage logic. ——
+    if custom_cleanup_enabled and merchant_xy:
         mx, my = merchant_xy
         ConsoleLog(BOT_NAME, "[Merchant] Dispatching sell_scrolls to alts")
         sell_scroll_refs = _dispatch_to_alts(
@@ -1371,7 +1825,7 @@ def _gh_merchant_setup(leave_party: bool = True) -> Generator:
         ConsoleLog(BOT_NAME, "[Merchant] No Merchant NPC found — skipping kit purchase")
 
     # —— Step 6: Sell Diamonds & Onyx to Rare Material Trader (leader + alts) ——
-    if _merchant_sell_rare_mats:
+    if custom_cleanup_enabled and _merchant_sell_rare_mats:
         if rare_xy:
             rx, ry = rare_xy
             ConsoleLog(BOT_NAME, "[Merchant] Dispatching sell_rare_mats (Diamond/Onyx) to alts")
@@ -1393,7 +1847,7 @@ def _gh_merchant_setup(leave_party: bool = True) -> Generator:
     # —— Step 7: Buy ectos from storage excess (leader + alts independently)
     # Storage is PER-ACCOUNT in GW — each account checks its own storage independently.
     # Always dispatch to alts so each alt can buy if ITS OWN storage exceeds threshold.
-    if _merchant_buy_ectos and rare_xy:
+    if custom_cleanup_enabled and _merchant_buy_ectos and rare_xy:
         rx, ry = rare_xy
         ConsoleLog(BOT_NAME, f"[Merchant] Dispatching buy_ectoplasm to all alts (threshold={_merchant_ecto_threshold:,})")
         buy_ecto_refs = _dispatch_to_alts(
@@ -1414,7 +1868,7 @@ def _gh_merchant_setup(leave_party: bool = True) -> Generator:
         else:
             ConsoleLog(BOT_NAME, f"[Merchant] Leader storage ({leader_storage:,}) at/below threshold — skipping leader ecto buy")
         yield from _wait_for_alt_dispatch_completion("buy_ectoplasm", buy_ecto_refs, SharedCommandType.MerchantMaterials)
-    elif _merchant_buy_ectos:
+    elif custom_cleanup_enabled and _merchant_buy_ectos:
         ConsoleLog(BOT_NAME, "[Merchant] Ecto buy skipped — no Rare Material Trader found")
 
     # —— Step 8: Wait for alts to finish their queued actions —————————————————
@@ -1428,7 +1882,7 @@ def _gh_merchant_setup(leave_party: bool = True) -> Generator:
     ConsoleLog(BOT_NAME, "[Merchant] Guild Hall merchant run complete")
     yield
 
-def _resign_all_to_outpost_before_merchant() -> Generator:
+def _resign_all_to_outpost_before_merchant() -> Generator[Any, Any, bool]:
     ConsoleLog(BOT_NAME, "[Merchant] Resigning all accounts before Guild Hall merchant routine")
     start_map_id = int(Map.GetMapID())
     my_email = Player.GetAccountEmail()
@@ -1438,13 +1892,21 @@ def _resign_all_to_outpost_before_merchant() -> Generator:
     Player.SendChatCommand("resign")
     yield from Routines.Yield.wait(500)
 
-    map_change_deadline = time.time() + 45.0
-    while time.time() < map_change_deadline:
-        if int(Map.GetMapID()) != start_map_id:
-            break
+    # Never block the run forever here. If resign does not complete, skip the GH
+    # merchant pass and let the normal Sparkfly/Tekks loop continue.
+    outpost_deadline = time.time() + 60.0
+    while time.time() < outpost_deadline:
+        if Map.IsOutpost() and Routines.Checks.Map.MapValid():
+            ConsoleLog(BOT_NAME, "[Merchant] Resign complete; outpost loaded.", Py4GW.Console.MessageType.Info)
+            return True
         yield from Routines.Yield.wait(250)
 
-    yield from bot.Wait._coro_until_on_outpost()
+    ConsoleLog(
+        BOT_NAME,
+        f"[Merchant] Resign/outpost wait timed out after 60s (start_map={start_map_id}, current_map={Map.GetMapID()}); skipping GH merchant pass.",
+        Py4GW.Console.MessageType.Warning,
+    )
+    return False
 
 
 def _summon_and_invite_party(settle_ms: int = 1000) -> Generator:
@@ -1549,6 +2011,11 @@ def _summon_and_invite_party(settle_ms: int = 1000) -> Generator:
     yield
 
 def _gh_merchant_setup_for_alt_salvage_threshold() -> Generator:
+    if not _merchant_enabled:
+        ConsoleLog(BOT_NAME, "[Merchant] Skipping alt salvage restock check: merchant routine disabled.", Py4GW.Console.MessageType.Info)
+        yield
+        return
+
     _write_local_salvage_kit_count()
     yield from _request_alt_salvage_kit_counts()
     needs_restock, low_accounts, unknown_accounts = _alts_need_salvage_restock()
@@ -1566,22 +2033,148 @@ def _gh_merchant_setup_for_alt_salvage_threshold() -> Generator:
         BOT_NAME,
         f"[Merchant] Alt salvage trigger hit: {', '.join(low_accounts)}. Running Guild Hall merchant routine.",
     )
-    yield from _resign_all_to_outpost_before_merchant()
-    yield from Routines.Yield.wait(10000)
+    resigned = yield from _resign_all_to_outpost_before_merchant()
+    if not resigned:
+        yield
+        return
+    yield from Routines.Yield.wait(3000)
     yield from _gh_merchant_setup(leave_party=True)
     bot.config.FSM.jump_to_state_by_name("Reset Post Merchant")
 
 
+def _get_shared_memory_free_slot_count(account_email: str) -> int:
+    """Best-effort free-slot count from shared-memory inventory bags; avoids requiring an IPC reply."""
+    try:
+        account = GLOBAL_CACHE.ShMem.GetAccountDataFromEmail(account_email)
+        if account is None:
+            return -1
+        total_size = 0
+        occupied = 0
+        for bag in account.InventoryBags.iter_bags():
+            bag_size = int(getattr(bag, "Size", 0) or 0)
+            if bag_size <= 0:
+                continue
+            total_size += bag_size
+            for slot_index in range(min(bag_size, len(bag.Slots))):
+                slot = bag.Slots[slot_index]
+                model_id = int(getattr(slot, "ModelID", 0) or 0)
+                quantity = int(getattr(slot, "Quantity", 0) or 0)
+                if model_id > 0 and quantity > 0:
+                    occupied += 1
+        if total_size <= 0:
+            return -1
+        return max(0, total_size - occupied)
+    except Exception:
+        return -1
+
+
+def _request_alt_free_slot_counts() -> Generator[Any, Any, tuple[list[tuple[str, int]], list[str], list[tuple[str, int]]]]:
+    """Return (low_accounts, unknown_accounts, ok_accounts) for alt free slots using the merchant widget threshold."""
+    my_email = Player.GetAccountEmail()
+    alt_accounts = [acc for acc in GLOBAL_CACHE.ShMem.GetAllAccountData() if acc.AccountEmail and acc.AccountEmail != my_email]
+    if not alt_accounts:
+        return [], [], []
+
+    low_accounts: list[tuple[str, int]] = []
+    unknown_accounts: list[str] = []
+    ok_accounts: list[tuple[str, int]] = []
+    pending: dict[str, str] = {}
+
+    # Dispatch all requests first, then wait once for the whole party.  This avoids
+    # looking stuck at this step for N * timeout when several alts are slow/offline.
+    for acc in alt_accounts:
+        name = acc.AgentData.CharacterName or acc.AccountEmail
+        pending[acc.AccountEmail] = name
+        reset_inventory_count(acc.AccountEmail, 0, 0)
+        GLOBAL_CACHE.ShMem.SendMessage(
+            my_email,
+            acc.AccountEmail,
+            SharedCommandType.InventoryQuery,
+            (0.0, 0.0, 0.0, 0.0),
+            ("report_free_slots",),
+        )
+
+    deadline = time.time() + (_FROGGY_IPC_POLL_MAX_TOTAL_MS / 1000.0)
+    while pending and time.time() < deadline:
+        for account_email, name in list(pending.items()):
+            free_slots = get_inventory_count(account_email, 0, 0)
+            if free_slots < 0:
+                continue
+            pending.pop(account_email, None)
+            if free_slots <= _inventory_slots_threshold:
+                low_accounts.append((name, free_slots))
+            else:
+                ok_accounts.append((name, free_slots))
+        if pending:
+            yield from Routines.Yield.wait(_FROGGY_IPC_POLL_TIMEOUT_MS)
+
+    # If the IPC handler did not answer (e.g. alts have not reloaded Messaging.py),
+    # fall back to the inventory snapshot already published in shared memory.
+    for account_email, name in list(pending.items()):
+        free_slots = _get_shared_memory_free_slot_count(account_email)
+        if free_slots < 0:
+            unknown_accounts.append(name)
+        elif free_slots <= _inventory_slots_threshold:
+            low_accounts.append((name, free_slots))
+        else:
+            ok_accounts.append((name, free_slots))
+
+    return low_accounts, unknown_accounts, ok_accounts
+
+
 def _gh_merchant_setup_if_inventory_full() -> Generator:
-    """After quest reward: if only 1 free inventory slot remains, resign to outpost then run the full GH merchant routine."""
-    free_slots = int(GLOBAL_CACHE.Inventory.GetFreeSlotCount())
-    if free_slots > _inventory_slots_threshold:
+    """After quest reward: if merchant is enabled and any account has low free slots, run GH merchant."""
+    if not _merchant_enabled:
+        ConsoleLog(BOT_NAME, "[Merchant] Skipping inventory restock check: merchant routine disabled.", Py4GW.Console.MessageType.Info)
         yield
         return
-    ConsoleLog(BOT_NAME, f"[Merchant] Inventory nearly full ({free_slots} free slot) — resigning to outpost then triggering GH merchant run")
 
-    yield from _resign_all_to_outpost_before_merchant()
-    yield from Routines.Yield.wait(10000)
+    leader_free_slots = int(GLOBAL_CACHE.Inventory.GetFreeSlotCount())
+    ConsoleLog(
+        BOT_NAME,
+        f"[Merchant] Free-slot threshold check: leader={leader_free_slots}, threshold={_inventory_slots_threshold}.",
+        Py4GW.Console.MessageType.Info,
+    )
+
+    low_accounts: list[tuple[str, int]] = []
+    ok_accounts: list[tuple[str, int]] = []
+    if leader_free_slots <= _inventory_slots_threshold:
+        low_accounts.append((Player.GetName() or "Leader", leader_free_slots))
+    else:
+        ok_accounts.append((Player.GetName() or "Leader", leader_free_slots))
+
+    alt_low_accounts, unknown_accounts, alt_ok_accounts = yield from _request_alt_free_slot_counts()
+    low_accounts.extend(alt_low_accounts)
+    ok_accounts.extend(alt_ok_accounts)
+
+    if unknown_accounts:
+        ConsoleLog(
+            BOT_NAME,
+            f"[Merchant] Alt free-slot count unknown this pass: {', '.join(unknown_accounts)}",
+            Py4GW.Console.MessageType.Warning,
+        )
+
+    if not low_accounts:
+        ok_summary = ", ".join(f"{name}={slots}" for name, slots in ok_accounts) or "none"
+        ConsoleLog(
+            BOT_NAME,
+            f"[Merchant] Inventory free slots OK on all known accounts (threshold={_inventory_slots_threshold}; {ok_summary}).",
+            Py4GW.Console.MessageType.Info,
+        )
+        yield
+        return
+
+    low_summary = ", ".join(f"{name}={slots}" for name, slots in low_accounts)
+    ConsoleLog(
+        BOT_NAME,
+        f"[Merchant] Inventory threshold hit ({low_summary}; threshold={_inventory_slots_threshold}) — resigning to outpost then triggering GH merchant run",
+    )
+
+    resigned = yield from _resign_all_to_outpost_before_merchant()
+    if not resigned:
+        yield
+        return
+    yield from Routines.Yield.wait(3000)
     yield from _gh_merchant_setup(leave_party=True)
     bot.config.FSM.jump_to_state_by_name("Reset Post Merchant")
 
@@ -1590,7 +2183,7 @@ def _gh_merchant_setup_if_inventory_full() -> Generator:
 def _ensure_ini_initialized() -> bool:
     """Load all settings and statistics from INI on first call. Returns True when ready."""
     global _settings_loaded
-    global _use_hard_mode, _randomize_district
+    global _use_hard_mode, _randomize_district, _use_precons_running, _use_precons_level1, _use_precons_level2
     global _merchant_enabled, _merchant_id_kits_target, _merchant_salvage_kits_target
     global _inventory_slots_threshold, _merchant_store_consumable_materials
     global _merchant_sell_materials, _merchant_sell_rare_mats, _merchant_buy_ectos
@@ -1606,6 +2199,10 @@ def _ensure_ini_initialized() -> bool:
     _S = _SETTINGS_SECTION
     _use_hard_mode      = _settings_ini.read_bool(_S, "use_hard_mode",      True)
     _randomize_district = _settings_ini.read_bool(_S, "randomize_district", True)
+    _legacy_precons     = _settings_ini.read_bool(_S, "use_precons",        True)
+    _use_precons_running = _settings_ini.read_bool(_S, "use_precons_running", _legacy_precons)
+    _use_precons_level1  = _settings_ini.read_bool(_S, "use_precons_level1",  _legacy_precons)
+    _use_precons_level2  = _settings_ini.read_bool(_S, "use_precons_level2",  _legacy_precons)
 
     _M = _MERCHANT_SECTION
     _merchant_enabled                    = _settings_ini.read_bool(_M, "enabled",                    False)
@@ -1674,6 +2271,9 @@ def _write_settings() -> None:
     _S = _SETTINGS_SECTION
     _settings_ini.write_key(_S, "use_hard_mode",      str(_use_hard_mode))
     _settings_ini.write_key(_S, "randomize_district", str(_randomize_district))
+    _settings_ini.write_key(_S, "use_precons_running", str(_use_precons_running))
+    _settings_ini.write_key(_S, "use_precons_level1",  str(_use_precons_level1))
+    _settings_ini.write_key(_S, "use_precons_level2",  str(_use_precons_level2))
 
     _M = _MERCHANT_SECTION
     _settings_ini.write_key(_M, "enabled",                    str(_merchant_enabled))
@@ -1930,19 +2530,33 @@ def _record_drops_after_loot() -> Generator:
     total_froggy_this_run = 0
     total_gb_this_run  = 0
     for acc_key in all_accounts_keys:
-        post_count = max(0, _settings_ini.read_int(_FROGGY_RUN_SECTION,      acc_key, 0))
-        snap_count = max(0, _settings_ini.read_int(_FROGGY_SNAPSHOT_SECTION, acc_key, 0))
-        delta      = max(0, post_count - snap_count)
-        ConsoleLog(BOT_NAME, f"[FROGGY Stats] {acc_key}: snap={snap_count} post={post_count} delta={delta}", log=True)
-        _accumulate_froggy(acc_key, delta)
-        total_froggy_this_run += delta
+        post_count = _settings_ini.read_int(_FROGGY_RUN_SECTION,      acc_key, -1)
+        snap_count = _settings_ini.read_int(_FROGGY_SNAPSHOT_SECTION, acc_key, -1)
+        if post_count < 0 or snap_count < 0:
+            ConsoleLog(
+                BOT_NAME,
+                f"[FROGGY Stats] {acc_key}: skipping FROGGY delta because count is unknown (snap={snap_count}, post={post_count}).",
+                Py4GW.Console.MessageType.Warning,
+            )
+        else:
+            delta = max(0, post_count - snap_count)
+            ConsoleLog(BOT_NAME, f"[FROGGY Stats] {acc_key}: snap={snap_count} post={post_count} delta={delta}", log=True)
+            _accumulate_froggy(acc_key, delta)
+            total_froggy_this_run += delta
 
-        gb_post = max(0, _settings_ini.read_int(_GB_RUN_SECTION,      acc_key, 0))
-        gb_snap = max(0, _settings_ini.read_int(_GB_SNAPSHOT_SECTION, acc_key, 0))
-        gb_delta = max(0, gb_post - gb_snap)
-        ConsoleLog(BOT_NAME, f"[FROGGY Stats] {acc_key} GB: snap={gb_snap} post={gb_post} delta={gb_delta}", log=True)
-        _accumulate_gb(acc_key, gb_delta)
-        total_gb_this_run += gb_delta
+        gb_post = _settings_ini.read_int(_GB_RUN_SECTION,      acc_key, -1)
+        gb_snap = _settings_ini.read_int(_GB_SNAPSHOT_SECTION, acc_key, -1)
+        if gb_post < 0 or gb_snap < 0:
+            ConsoleLog(
+                BOT_NAME,
+                f"[FROGGY Stats] {acc_key} GB: skipping delta because count is unknown (snap={gb_snap}, post={gb_post}).",
+                Py4GW.Console.MessageType.Warning,
+            )
+        else:
+            gb_delta = max(0, gb_post - gb_snap)
+            ConsoleLog(BOT_NAME, f"[FROGGY Stats] {acc_key} GB: snap={gb_snap} post={gb_post} delta={gb_delta}", log=True)
+            _accumulate_gb(acc_key, gb_delta)
+            total_gb_this_run += gb_delta
 
     ConsoleLog(BOT_NAME, f"[FROGGY Stats] Run complete. FROGGY={total_froggy_this_run} GB={total_gb_this_run}", log=True)
     _save_settings()
@@ -2603,15 +3217,20 @@ def wait_for_map_change(target_map_id, timeout_seconds=60):
 
 def _on_party_wipe(bot: "Botting"):
     global L2_BOSS_ROUTE_UNLOCKED
-    # Wait until we are alive again
-    while Agent.IsDead(Player.GetAgentID()):
-        yield from bot.Wait._coro_for_time(1000)
-        if not Routines.Checks.Map.MapValid():
-            bot.config.FSM.resume()
-            return
+    wipe_pos = Player.GetXY()
+    if not wipe_pos:
+        wipe_pos = (0.0, 0.0)
 
-    ConsoleLog("Res Check", "We ressed retrying!")
-    yield from bot.Wait._coro_for_time(3000)
+    # Wait for the dungeon wipe respawn instead of reusing whatever movement was
+    # active when we died.  The movement state we jump to below will create a new
+    # Mission Map-style navmesh path from the respawn shrine to the next target.
+    yield from _wait_for_respawn_position_change((float(wipe_pos[0]), float(wipe_pos[1])), "wipe recovery")
+    if not Routines.Checks.Map.MapValid():
+        bot.config.FSM.resume()
+        return
+
+    ConsoleLog("Res Check", "Respawn confirmed; rebuilding route from current position.")
+    yield from bot.Wait._coro_for_time(500)
 
     # Map-safe anchors (YOU said you replaced jumps by headers)
     # These should be the JUMPABLE step names (anchors), not just visual headers.
@@ -2623,9 +3242,8 @@ def _on_party_wipe(bot: "Botting"):
         ],
         BOGROOT_L2: [
             ("Secure return - L2", -11055.0, -5551.0),
-            ("Secure return 2 - L2", -955.0, 10984.0),
-            ("Secure return 3 - L2", 8591.0, 4285.0),
-            ("Secure return - Boss", 19619.0, -11498.0)
+            ("Secure return 2 - L2", 8591.0, 4285.0),
+            ("Secure return - Boss", 19544.0, -11840.0),
         ],
     }
 
@@ -2656,13 +3274,10 @@ def _on_party_wipe(bot: "Botting"):
         bot.config.FSM.resume()
         return
 
-    # Full party defeated -> let widget handle return
-    if GLOBAL_CACHE.Party.IsPartyDefeated():
-        yield from bot.Wait._coro_for_time(10000)
-        bot.config.FSM.jump_to_state_by_name("Reset farm")
-        bot.config.FSM.resume()
-        return
-    
+    # Full party defeated in Bogroot respawns the party at a shrine after ~10s.
+    # Do not restart the entire farm or keep the old move action; resume at the
+    # nearest secure anchor so the following movement state computes a fresh path
+    # from the new shrine position to the next recorded target.
     chosen = pick_nearest_anchor(map_id, float(player_x), float(player_y))
 
     if map_id == BOGROOT_L2:
@@ -2690,9 +3305,7 @@ def S_Path(name: str, points: list[tuple[float, float]], map_id: Optional[int] =
     # âœ… Step "ancre" jumpable
     bot.States.AddCustomState(_step_anchor, name)
 
-    n = len(points)
-    for i, (x, y) in enumerate(points, start=1):
-        bot.Move.XY(float(x), float(y), step_name=f"{name} - {i}/{n}")
+    AddMissionMapPath(points, name)
 
 def UseSummons():
     """
@@ -2757,6 +3370,60 @@ def apply_widget_policy_step() -> Generator:
     yield from _disable_widgets_on_alts_only(_ALT_ONLY_DISABLE_WIDGETS)
     yield
 
+
+def _force_leader_hero_ai_combat() -> Generator:
+    """Make startup deterministic when the leader's HeroAI combat toggle was left off."""
+    bot.ResetHeroAICombatState(
+        active=True,
+        following=True,
+        targeting=True,
+        combat=True,
+        skills=True,
+    )
+    ConsoleLog(BOT_NAME, "Leader HeroAI combat/options forced ON.", Py4GW.Console.MessageType.Info)
+    yield from Routines.Yield.wait(250)
+    yield
+
+
+def _set_dungeon_looting(enabled: bool, reason: str = "") -> Generator:
+    """Disable LootManager/auto-loot during the Sparkfly run, re-enable inside Bogroot."""
+    enabled = bool(enabled)
+    action = SharedCommandType.EnableWidget if enabled else SharedCommandType.DisableWidget
+    widget_handler = get_widget_handler()
+
+    if enabled:
+        if not widget_handler.is_widget_enabled("LootManager"):
+            widget_handler.enable_widget("LootManager")
+        bot.Properties.ApplyNow("auto_loot", "active", True)
+        bot.ResetHeroAICombatState(active=True, following=True, targeting=True, combat=True, looting=True, skills=True)
+    else:
+        if widget_handler.is_widget_enabled("LootManager"):
+            widget_handler.disable_widget("LootManager")
+        bot.Properties.ApplyNow("auto_loot", "active", False)
+        bot.ResetHeroAICombatState(active=True, following=True, targeting=True, combat=True, looting=False, skills=True)
+
+    sender_email = Player.GetAccountEmail()
+    if sender_email:
+        for account in GLOBAL_CACHE.ShMem.GetAllAccountData():
+            account_email = getattr(account, "AccountEmail", "")
+            if not account_email or account_email == sender_email:
+                continue
+            GLOBAL_CACHE.ShMem.SendMessage(
+                sender_email,
+                account_email,
+                action,
+                (0, 0, 0, 0),
+                ("LootManager", "", "", ""),
+            )
+
+    ConsoleLog(
+        BOT_NAME,
+        f"Looting {'enabled' if enabled else 'disabled'} ({reason}).",
+        Py4GW.Console.MessageType.Info,
+    )
+    yield from Routines.Yield.wait(500)
+    yield
+
 # --- Settings and Bot UI Helpers ---
 
 def _draw_difficulty_setting() -> None:
@@ -2778,6 +3445,68 @@ def _draw_district_setting() -> None:
     if new_val != _randomize_district:
         _randomize_district = new_val
         _save_settings()
+
+def _use_all_consumables_now() -> None:
+    try:
+        from Py4GWCoreLib.routines_src.behaviourtrees_src.botting_consumables import consumable_specs
+        from Py4GWCoreLib.routines_src.behaviourtrees_src.botting_consumables import send_consumable_to_accounts
+        from Py4GWCoreLib.routines_src.behaviourtrees_src.botting_consumables import use_local_consumable
+
+        for model_id, effect_name in consumable_specs("all"):
+            effect_id = int(GLOBAL_CACHE.Skill.GetID(effect_name) or 0)
+            use_local_consumable(int(model_id), effect_id)
+            send_consumable_to_accounts(int(model_id), effect_id)
+        ConsoleLog(BOT_NAME, "Use all consumables requested for leader and alts.", Py4GW.Console.MessageType.Info)
+    except Exception as exc:
+        ConsoleLog(BOT_NAME, f"Use all consumables failed: {exc}", Py4GW.Console.MessageType.Error)
+
+
+def _precons_enabled_for_phase(phase: str) -> bool:
+    if phase == "running":
+        return _use_precons_running
+    if phase == "level1":
+        return _use_precons_level1
+    if phase == "level2":
+        return _use_precons_level2
+    return False
+
+
+def _use_precons_if_enabled(phase: str, context: str = "") -> Generator:
+    _ensure_ini_initialized()
+    if not _precons_enabled_for_phase(phase):
+        suffix = f" {context}" if context else ""
+        ConsoleLog(BOT_NAME, f"Skipping precons{suffix}: {phase} precons disabled in settings.", Py4GW.Console.MessageType.Info)
+        yield
+        return
+
+    _use_all_consumables_now()
+    yield from Routines.Yield.wait(1000)
+
+
+def _draw_consumable_button() -> None:
+    import PyImGui
+    global _use_precons_running, _use_precons_level1, _use_precons_level2
+
+    _ensure_ini_initialized()
+    PyImGui.text("Use precons automatically:")
+
+    new_running = PyImGui.checkbox("Running to dungeon##froggy_precons_running", _use_precons_running)
+    if new_running != _use_precons_running:
+        _use_precons_running = new_running
+        _save_settings()
+
+    new_l1 = PyImGui.checkbox("Level 1##froggy_precons_l1", _use_precons_level1)
+    if new_l1 != _use_precons_level1:
+        _use_precons_level1 = new_l1
+        _save_settings()
+
+    new_l2 = PyImGui.checkbox("Level 2##froggy_precons_l2", _use_precons_level2)
+    if new_l2 != _use_precons_level2:
+        _use_precons_level2 = new_l2
+        _save_settings()
+
+    if PyImGui.button("Use all consumables now##froggy_recorded_use_cons"):
+        _use_all_consumables_now()
 
 def _draw_merchant_settings() -> None:
     import PyImGui
@@ -2858,6 +3587,7 @@ def _draw_froggy_settings() -> None:
     PyImGui.separator()
     _draw_difficulty_setting()
     _draw_district_setting()
+    _draw_consumable_button()
     _draw_merchant_settings()
 
 # ==================== INITIALIZATION ====================

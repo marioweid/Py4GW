@@ -117,6 +117,8 @@ NPC_TARGETS: dict[str, AgentTargetValue] = {
     "LIONGUARD_FIGO": (((1, 129, 252, 78, 235, 179, 236, 223, 85, 52, 0, 0),), "Lionguard Figo"),
     "LIONGUARD_NEIRO": (((1, 129, 238, 1, 30, 225, 94, 182, 64, 96, 0, 0),), "Lionguard Neiro"),
     "LATHAM": (((1, 129, 157, 122, 30, 229, 130, 189, 135, 44, 0, 0),), "Latham"),
+    "WEAPON_KREWE_MEMBER": (((2, 129, 35, 36, 85, 139, 201, 158, 92, 33, 0, 0),), "Weapon Krewe Member"),
+    "TEKKS": (((1, 129, 207, 117, 96, 166, 0, 143, 126, 46, 0, 0),), "Tekks"),
     "OLIAS": (((1, 129, 251, 56, 0, 0),), "Olias"),
     "ELDER_SUHL": (((1, 129, 205, 19, 150, 248, 63, 173, 90, 92, 0, 0),), "Elder Suhl"),
     "GENERAL_MORGAHN": (((1, 129, 46, 56, 190, 161, 71, 197, 251, 127, 0, 0),), "General Morgahn"),
@@ -364,6 +366,8 @@ ENEMY_TARGETS: dict[str, AgentTargetValue] = {
 GADGET_TARGETS: dict[str, AgentTargetValue] = {
     "CHARR_ALTAR": (((48, 33, 40, 149, 70, 253, 11, 73, 0, 0),), "Charr Altar"),
     "CHEST": (((123, 32, 56, 239, 111, 184, 88, 49, 0, 0),), "Chest"),
+    "BOGROOT_CHEST": (((2, 129, 93, 40, 137, 247, 20, 165, 34, 102, 0, 0),), "Bogroot Chest"),
+    "BEACON_OF_DROKNAR": (((2, 129, 189, 34, 175, 164, 87, 198, 207, 23, 0, 0),), "Beacon of Droknar"),
     "CHEST_OF_WOE": (((2, 129, 148, 49, 154, 172, 124, 229, 33, 98, 0, 0),), "Chest of Woe"),
     "CHEST_OF_BURROWS": (((2, 129, 87, 40, 105, 234, 7, 193, 85, 122, 0, 0),), "Chest of Burrows"),
     "COMMAND_POST": (((1, 129, 55, 3, 0, 0),), "Command Post"),

@@ -292,6 +292,7 @@ def _route_pause_on_combat(step: dict[str, Any], mode: str) -> bool:
 def _build_interact(step: dict[str, Any], context: JsonBTCompilerContext) -> BehaviorTree:
     action = _choice(step, "action", "target")
     log = _bool(step.get("log"), False)
+    multibox = _bool(step.get("multibox"), False)
     if action == "dialog":
         ids = _dialog_ids(step)
         if not ids:
@@ -303,6 +304,8 @@ def _build_interact(step: dict[str, Any], context: JsonBTCompilerContext) -> Beh
                 trees.append(_interact_and_dialog_tree(step, context, dialog_id))
             else:
                 trees.append(BT.Player.SendDialog(dialog_id=dialog_id, log=_bool(step.get("log"), False)))
+            if multibox:
+                trees.append(_send_dialog_to_target_multibox_tree(step, dialog_id))
             if interval_ms:
                 trees.append(BT.Player.Wait(interval_ms, log=False))
         return _sequence("InteractDialog", trees)
@@ -314,7 +317,16 @@ def _build_interact(step: dict[str, Any], context: JsonBTCompilerContext) -> Beh
     if action == "target":
         target = _choice(step, "target", _choice(step, "kind", "npc"))
         if target in {"npc", "gadget", "item"}:
-            return _interact_tree(step, context, target)
+            interact_tree = _interact_tree(step, context, target)
+            if multibox:
+                return _sequence(
+                    f"MultiboxInteract{target.title()}",
+                    [
+                        interact_tree,
+                        _send_interact_with_target_multibox_tree(step),
+                    ],
+                )
+            return interact_tree
         raise RecipeCompileError(f"Recipe {context.recipe_name!r} has unsupported interact target {target!r}.")
     raise RecipeCompileError(f"Recipe {context.recipe_name!r} has unsupported interact action {action!r}.")
 
@@ -574,6 +586,100 @@ def _interact_and_dialog_tree(step: dict[str, Any], context: JsonBTCompilerConte
     )
 
 
+def _send_dialog_to_target_multibox_tree(step: dict[str, Any], dialog_id: str | int) -> BehaviorTree:
+    refs_key = f"dialog_refs_{abs(hash(str(step.get('name', 'dialog'))))}"
+    return _sequence(
+        "MultiboxSendDialogToTarget",
+        [
+            _send_selected_target_command_tree(
+                command_name="SendDialogToTarget",
+                params_fn=lambda target_id: (int(target_id), int(_int(dialog_id, 0)), 0, 0),
+                refs_blackboard_key=refs_key,
+                log=_bool(step.get("log"), False),
+            ),
+            BT.Shared.WaitCommandDispatch(
+                command=_shared_command("SendDialogToTarget"),
+                refs_blackboard_key=refs_key,
+                timeout_ms=max(1000, _int(step.get("multibox_timeout_ms"), 15000)),
+                poll_interval_ms=250,
+                log=_bool(step.get("log"), False),
+            ),
+        ],
+    )
+
+
+def _send_interact_with_target_multibox_tree(step: dict[str, Any]) -> BehaviorTree:
+    refs_key = f"interact_refs_{abs(hash(str(step.get('name', 'interact'))))}"
+    return _sequence(
+        "MultiboxInteractWithTarget",
+        [
+            _send_selected_target_command_tree(
+                command_name="InteractWithTarget",
+                params_fn=lambda target_id: (int(target_id), 0, 0, 0),
+                refs_blackboard_key=refs_key,
+                log=_bool(step.get("log"), False),
+            ),
+            BT.Shared.WaitCommandDispatch(
+                command=_shared_command("InteractWithTarget"),
+                refs_blackboard_key=refs_key,
+                timeout_ms=max(1000, _int(step.get("multibox_timeout_ms"), 15000)),
+                poll_interval_ms=250,
+                log=_bool(step.get("log"), False),
+            ),
+        ],
+    )
+
+
+def _send_selected_target_command_tree(
+    *,
+    command_name: str,
+    params_fn: Callable[[int], tuple[int, int, int, int]],
+    refs_blackboard_key: str,
+    log: bool,
+) -> BehaviorTree:
+    def _send(node: BehaviorTree.Node) -> BehaviorTree.NodeState:
+        from Py4GWCoreLib import GLOBAL_CACHE, Player
+
+        sender_email = str(Player.GetAccountEmail() or "").strip()
+        sender_key = sender_email.casefold()
+        target_id = int(Player.GetTargetID() or 0)
+        if not sender_email or target_id <= 0:
+            node.blackboard[refs_blackboard_key] = []
+            return BehaviorTree.NodeState.FAILURE
+
+        command = _shared_command(command_name)
+        refs = []
+        for account in GLOBAL_CACHE.ShMem.GetAllAccountData() or []:
+            receiver_email = str(getattr(account, "AccountEmail", "") or "").strip()
+            if not receiver_email or receiver_email.casefold() == sender_key:
+                continue
+            message_index = int(
+                GLOBAL_CACHE.ShMem.SendMessage(
+                    sender_email,
+                    receiver_email,
+                    command,
+                    params_fn(target_id),
+                )
+            )
+            refs.append((receiver_email, message_index))
+
+        node.blackboard[refs_blackboard_key] = refs
+        node.blackboard[f"{refs_blackboard_key}_command"] = int(command.value)
+        if log:
+            from Py4GWCoreLib import Console, ConsoleLog
+
+            ConsoleLog("Modular", f"Sent {command_name} to {len(refs)} alt account(s).", Console.MessageType.Info)
+        return BehaviorTree.NodeState.SUCCESS
+
+    return BehaviorTree(BehaviorTree.ActionNode(name=f"SendSelectedTarget::{command_name}", action_fn=_send))
+
+
+def _shared_command(command_name: str):
+    from Py4GWCoreLib.enums_src.Multiboxing_enums import SharedCommandType
+
+    return getattr(SharedCommandType, command_name)
+
+
 def _move_to_point_tree(step: dict[str, Any], point: tuple[float, float], *, log: bool) -> BehaviorTree:
     return BT.Movement.Move(
         x=point[0],
@@ -647,11 +753,12 @@ def _target_tree(step: dict[str, Any], context: JsonBTCompilerContext, target: s
 
 
 def _target_named_agent(kind: str, key: str, *, max_dist: float) -> BehaviorTree:
+    from .domain.target_registry import AgentTargetDefinition
     from .domain.target_registry import get_named_agent_target
 
     definition = get_named_agent_target(kind, key)
     if definition is None:
-        raise RecipeCompileError(f"Unknown {kind} selector {key!r}.")
+        definition = AgentTargetDefinition(display_name=str(key or "").strip())
 
     def _target() -> BehaviorTree.NodeState:
         from Py4GWCoreLib import AgentArray, Player

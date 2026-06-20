@@ -1,0 +1,376 @@
+{
+  "name": "Frog Farm Modular",
+  "status": "route-draft",
+  "notes": [
+    "Routes come from the first recorded pass and are intentionally split into small testable sections.",
+    "Unknown portal coordinates are represented as wait anchors until they are recorded.",
+    "Sparkfly entry route is NoCombat movement; dungeon routes use move-and-kill by default.",
+    "Steps marked multibox=true use shared-memory commands so alt accounts also take dialogs, interact with locks, and open the chest."
+  ],
+  "map_ids": {
+    "gadds_encampment": 638,
+    "sparkfly_swamp": 558,
+    "bogroot_growths_level_1": 615,
+    "bogroot_growths_level_2": 616
+  },
+  "dialogs": {
+    "dwarven_blessing": "0x84",
+    "tekks_take_quest": "0x833901",
+    "tekks_reward": "0x833907"
+  },
+  "todo_sections": [
+    {
+      "key": "sparkfly_entry_portal",
+      "title": "Sparkfly portal into dungeon",
+      "needed": [
+        "exact portal coordinate for Bogroot level 1 transition"
+      ]
+    },
+    {
+      "key": "level_1_to_level_2",
+      "title": "Level 1 portal into level 2",
+      "needed": [
+        "exact portal coordinate for Bogroot level 2 transition"
+      ]
+    },
+    {
+      "key": "level_2_entry_blessing",
+      "title": "Level 2 first blessing",
+      "needed": [
+        "confirm exact Beacon of Droknar point or selector behavior at level 2 start"
+      ]
+    },
+    {
+      "key": "loot_and_loop",
+      "title": "Loop safety",
+      "needed": [
+        "confirm whether the 3 minute return to Sparkfly needs a wait_for_map_load timeout longer than 210000 ms",
+        "confirm whether the next loop should start directly at Tekks or retake the Sparkfly blessing first"
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "type": "route",
+      "name": "Sparkfly blessing approach",
+      "points": [
+        [
+          -7309,
+          -15549
+        ]
+      ],
+      "mode": "move",
+      "pause_on_combat": false
+    },
+    {
+      "type": "interact",
+      "name": "Take Sparkfly Dwarven blessing",
+      "id": "0x84",
+      "npc": "WEAPON_KREWE_MEMBER",
+      "target": "npc",
+      "max_dist": 6000,
+      "action": "dialog",
+      "multibox": true,
+      "pause_on_combat": false
+    },
+    {
+      "type": "inventory",
+      "name": "Use all consumables after Sparkfly blessing",
+      "action": "use_consumables",
+      "mode": "all",
+      "multibox": true
+    },
+    {
+      "type": "route",
+      "name": "Sparkfly run to Tekks",
+      "points": [
+        [
+          -1961,
+          -9310
+        ],
+        [
+          -352,
+          -1644
+        ],
+        [
+          4993,
+          11786
+        ],
+        [
+          8032,
+          18539
+        ],
+        [
+          12163,
+          22469
+        ]
+      ],
+      "mode": "move",
+      "pause_on_combat": false
+    },
+    {
+      "type": "interact",
+      "name": "Take quest from Tekks",
+      "id": "0x833901",
+      "npc": "Tekks",
+      "target": "npc",
+      "action": "dialog",
+      "multibox": true,
+      "max_dist": 6000
+    },
+    {
+      "type": "wait",
+      "name": "TODO record run into dungeon portal",
+      "ms": 100,
+      "anchor": true
+    },
+    {
+      "type": "map",
+      "name": "Wait for Bogroot Growths level 1",
+      "map_id": 615,
+      "action": "wait_for_map_load",
+      "timeout_ms": 60000
+    },
+    {
+      "type": "route",
+      "name": "Level 1 blessing approach",
+      "points": [
+        [
+          19004,
+          7771
+        ]
+      ],
+      "mode": "kill",
+      "anchor": true
+    },
+    {
+      "type": "interact",
+      "name": "Take level 1 Dwarven blessing",
+      "id": "0x84",
+      "target": "gadget",
+      "nearest": true,
+      "max_dist": 2500,
+      "action": "dialog",
+      "multibox": true
+    },
+    {
+      "type": "inventory",
+      "name": "Use all consumables after level 1 blessing",
+      "action": "use_consumables",
+      "mode": "all",
+      "multibox": true
+    },
+    {
+      "type": "route",
+      "name": "Level 1 clear to level 2 portal",
+      "points": [
+        [
+          6152,
+          4718
+        ],
+        [
+          7252,
+          -17026
+        ]
+      ],
+      "mode": "kill"
+    },
+    {
+      "type": "wait",
+      "name": "TODO record level 2 portal coordinate",
+      "ms": 100,
+      "anchor": true
+    },
+    {
+      "type": "map",
+      "name": "Wait for Bogroot Growths level 2",
+      "map_id": 616,
+      "action": "wait_for_map_load",
+      "timeout_ms": 60000
+    },
+    {
+      "type": "interact",
+      "name": "Take level 2 entry Dwarven blessing",
+      "id": "0x84",
+      "gadget": "BEACON_OF_DROKNAR",
+      "target": "gadget",
+      "action": "dialog",
+      "multibox": true,
+      "max_dist": 6000
+    },
+    {
+      "type": "inventory",
+      "name": "Use all consumables after level 2 entry blessing",
+      "action": "use_consumables",
+      "mode": "all",
+      "multibox": true
+    },
+    {
+      "type": "route",
+      "name": "Level 2 first route",
+      "points": [
+        [
+          -11480,
+          -1377
+        ],
+        [
+          -4185,
+          4926
+        ],
+        [
+          -2544,
+          5816
+        ],
+        [
+          -659,
+          8890
+        ],
+        [
+          4576,
+          13570
+        ],
+        [
+          6637,
+          9642
+        ],
+        [
+          8141,
+          7965
+        ],
+        [
+          8492,
+          7094
+        ],
+        [
+          8591,
+          4285
+        ]
+      ],
+      "mode": "kill",
+      "anchor": true
+    },
+    {
+      "type": "interact",
+      "name": "Take Beacon of Droknar blessing",
+      "id": "0x84",
+      "gadget": "BEACON_OF_DROKNAR",
+      "target": "gadget",
+      "action": "dialog",
+      "multibox": true,
+      "max_dist": 6000
+    },
+    {
+      "type": "route",
+      "name": "Level 2 boss lock approach",
+      "points": [
+        [
+          10738,
+          -4749
+        ],
+        [
+          16686,
+          -5886
+        ]
+      ],
+      "mode": "kill"
+    },
+    {
+      "type": "interact",
+      "name": "Open boss lock",
+      "gadget": "BOSS_LOCK",
+      "target": "gadget",
+      "action": "target",
+      "multibox": true,
+      "max_dist": 6000
+    },
+    {
+      "type": "route",
+      "name": "Level 2 boss blessing approach",
+      "points": [
+        [
+          19544,
+          -11840
+        ]
+      ],
+      "mode": "kill"
+    },
+    {
+      "type": "interact",
+      "name": "Take final Beacon of Droknar blessing",
+      "id": "0x84",
+      "gadget": "BEACON_OF_DROKNAR",
+      "target": "gadget",
+      "action": "dialog",
+      "multibox": true,
+      "max_dist": 6000
+    },
+    {
+      "type": "route",
+      "name": "Level 2 boss and chest approach",
+      "points": [
+        [
+          15782,
+          -17298
+        ],
+        [
+          15782,
+          -17298
+        ]
+      ],
+      "mode": "kill",
+      "anchor": true
+    },
+    {
+      "type": "interact",
+      "name": "Loot Bogroot chest",
+      "gadget": "BOGROOT_CHEST",
+      "target": "gadget",
+      "action": "target",
+      "multibox": true,
+      "max_dist": 6000
+    },
+    {
+      "type": "interact",
+      "name": "Loot Bogroot chest again",
+      "gadget": "BOGROOT_CHEST",
+      "target": "gadget",
+      "action": "target",
+      "multibox": true,
+      "max_dist": 6000
+    },
+    {
+      "type": "route",
+      "name": "Return to Tekks",
+      "points": [
+        [
+          15018,
+          -17666
+        ]
+      ],
+      "mode": "kill"
+    },
+    {
+      "type": "interact",
+      "name": "Turn in quest at Tekks",
+      "id": "0x833907",
+      "npc": "Tekks",
+      "target": "npc",
+      "action": "dialog",
+      "multibox": true,
+      "max_dist": 6000
+    },
+    {
+      "type": "map",
+      "name": "Wait for return to Sparkfly Swamp",
+      "map_id": 558,
+      "action": "wait_for_map_load",
+      "timeout_ms": 210000
+    },
+    {
+      "type": "wait",
+      "name": "Loop anchor - next run starts at Tekks",
+      "ms": 100,
+      "anchor": true
+    }
+  ]
+}

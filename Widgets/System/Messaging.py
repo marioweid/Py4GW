@@ -1121,19 +1121,33 @@ def MerchantMaterials(index: int, message: SharedMessageStruct):
                     ConsoleLog(MODULE_NAME, "MerchantMaterials sell_scrolls: no scrolls in inventory, skipping", Console.MessageType.Info, False)
 
         elif mode == "sell_nonsalvageable_golds":
-            # Check inventory first — skip NPC interaction if nothing to sell
+            # Identify and sell all gold items except FROGGY scepters.
             bag_list = GLOBAL_CACHE.ItemArray.CreateBagList(1, 2, 3, 4)
             item_array = GLOBAL_CACHE.ItemArray.GetItemArray(bag_list)
-            sell_ids = []
+            gold_ids = []
+            unid_gold_ids = []
             for item_id in item_array:
+                model_id = int(GLOBAL_CACHE.Item.GetModelID(item_id))
+                if 1953 <= model_id <= 1974:  # FROGGY scepters; never merchant-sell them.
+                    continue
                 _, rarity = GLOBAL_CACHE.Item.Rarity.GetRarity(item_id)
                 if rarity != "Gold":
                     continue
+                gold_ids.append(int(item_id))
                 if not GLOBAL_CACHE.Item.Usage.IsIdentified(item_id):
-                    continue
-                if GLOBAL_CACHE.Item.Usage.IsSalvageable(item_id):
-                    continue
-                sell_ids.append(int(item_id))
+                    unid_gold_ids.append(int(item_id))
+
+            if unid_gold_ids:
+                ConsoleLog(MODULE_NAME, f"MerchantMaterials sell_nonsalvageable_golds: identifying {len(unid_gold_ids)} gold item(s)", Console.MessageType.Info, False)
+                yield from Routines.Yield.Items.IdentifyItems(unid_gold_ids)
+                yield from Routines.Yield.wait(500)
+
+            sell_ids = [
+                int(item_id)
+                for item_id in gold_ids
+                if GLOBAL_CACHE.Item.Usage.IsIdentified(item_id)
+                and not (1953 <= int(GLOBAL_CACHE.Item.GetModelID(item_id)) <= 1974)
+            ]
             if sell_ids:
                 yield from Routines.Yield.Movement.FollowPath([(x, y)])
                 yield from Routines.Yield.wait(100)
@@ -1144,9 +1158,9 @@ def MerchantMaterials(index: int, message: SharedMessageStruct):
                     yield from Routines.Yield.wait(1200)
                     yield from Routines.Yield.Merchant.SellItems(sell_ids)
                     yield from Routines.Yield.wait(300)
-                    ConsoleLog(MODULE_NAME, f"MerchantMaterials sell_nonsalvageable_golds: sold {len(sell_ids)} item(s)", Console.MessageType.Info, False)
+                    ConsoleLog(MODULE_NAME, f"MerchantMaterials sell_nonsalvageable_golds: sold {len(sell_ids)} non-FROGGY gold item(s)", Console.MessageType.Info, False)
             else:
-                ConsoleLog(MODULE_NAME, "MerchantMaterials sell_nonsalvageable_golds: no items in inventory, skipping", Console.MessageType.Info, False)
+                ConsoleLog(MODULE_NAME, "MerchantMaterials sell_nonsalvageable_golds: no identified non-FROGGY gold items in inventory, skipping", Console.MessageType.Info, False)
         else:
             ConsoleLog(
                 MODULE_NAME,
@@ -2665,6 +2679,8 @@ def InventoryQuery(index: int, message: SharedMessageStruct):
     """Cross-account inventory count. extra0 modes:
        report_inventory_count: count Params[0..1] range, reply to sender.
        inventory_count_reply:  cache Params[2] under (sender, min, max).
+       report_free_slots:      report inventory free slots, cached under (sender, 0, 0).
+       free_slots_reply:       cache Params[2] under (sender, 0, 0).
     """
     GLOBAL_CACHE.ShMem.MarkMessageAsRunning(message.ReceiverEmail, index)
     extra0, _extra1, _extra2, _extra3 = _extra_data(message)
@@ -2698,6 +2714,23 @@ def InventoryQuery(index: int, message: SharedMessageStruct):
                         ("inventory_count_reply", my_email_local, "", ""),
                     )
 
+        elif mode == "report_free_slots":
+            try:
+                count = int(GLOBAL_CACHE.Inventory.GetFreeSlotCount())
+            except Exception as exc:
+                ConsoleLog(MODULE_NAME, f"[InventoryQuery] GetFreeSlotCount failed: {exc}", Console.MessageType.Error)
+                count = -1
+            sender = str(message.SenderEmail or "").strip()
+            my_email_local = str(message.ReceiverEmail or "").strip()
+            if sender:
+                GLOBAL_CACHE.ShMem.SendMessage(
+                    my_email_local,
+                    sender,
+                    SharedCommandType.InventoryQuery,
+                    (0.0, 0.0, float(count), 0.0),
+                    ("free_slots_reply", my_email_local, "", ""),
+                )
+
         elif mode == "inventory_count_reply":
             try:
                 range_start = int(message.Params[0])
@@ -2709,6 +2742,14 @@ def InventoryQuery(index: int, message: SharedMessageStruct):
             if range_start > 0 and range_end >= range_start:
                 key = (str(message.SenderEmail or ""), range_start, range_end)
                 _inventory_cache()[key] = count
+
+        elif mode == "free_slots_reply":
+            try:
+                count = int(message.Params[2])
+            except (TypeError, ValueError):
+                count = -1
+            key = (str(message.SenderEmail or ""), 0, 0)
+            _inventory_cache()[key] = count
     finally:
         GLOBAL_CACHE.ShMem.MarkMessageAsFinished(message.ReceiverEmail, index)
     yield

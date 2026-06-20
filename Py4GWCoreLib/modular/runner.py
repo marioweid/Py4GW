@@ -56,6 +56,8 @@ class BTRecipeRunner:
         start_index: int = 0,
         start_step_index: int = 0,
         loop: bool = False,
+        headless_heroai_enabled: bool = True,
+        suppress_party_wipe_recovery: bool = False,
         debug_hook: Callable[[str], None] | None = None,
     ) -> None:
         self.name = str(name)
@@ -63,6 +65,8 @@ class BTRecipeRunner:
         self._start_index = max(0, min(int(start_index), max(0, len(self._specs) - 1)))
         self._start_step_index = max(0, int(start_step_index))
         self._loop = bool(loop)
+        self._headless_heroai_enabled = bool(headless_heroai_enabled)
+        self._suppress_party_wipe_recovery = bool(suppress_party_wipe_recovery)
         self._debug_hook = debug_hook
         self._last_state: BehaviorTree.NodeState | None = None
         self._last_debug_phase_index: int | None = None
@@ -81,6 +85,7 @@ class BTRecipeRunner:
             pause_on_combat=False,
             isolation_enabled=False,
         )
+        self._botting_tree.SetHeadlessHeroAIEnabled(self._headless_heroai_enabled, reset_runtime=True)
         self._install_planner_steps(reset=True)
         self._debug(
             f"Initialized runner specs={len(self._specs)} compiled={len(self._recipes)} "
@@ -92,6 +97,7 @@ class BTRecipeRunner:
     def start(self) -> None:
         self.reset()
         self._botting_tree.Start()
+        self._apply_runtime_flags()
         self._debug("Started.")
 
     def stop(self) -> None:
@@ -122,6 +128,7 @@ class BTRecipeRunner:
         self._last_debug_state = None
         self._last_active_step_name = ""
         self._install_planner_steps(reset=True)
+        self._apply_runtime_flags()
 
     def is_running(self) -> bool:
         return self._botting_tree.IsStarted() and not self._botting_tree.IsPaused()
@@ -132,6 +139,7 @@ class BTRecipeRunner:
     def update(self) -> None:
         if not self._botting_tree.IsStarted():
             return
+        self._apply_runtime_flags()
         self._debug_progress()
         try:
             self._last_state = self._botting_tree.tick()
@@ -177,6 +185,22 @@ class BTRecipeRunner:
 
     def get_runtime_blackboard(self) -> dict:
         return dict(self._botting_tree.blackboard)
+
+    def restart_from_step_title(self, title: str) -> bool:
+        title_key = str(title or "").strip().casefold()
+        if not title_key:
+            return False
+
+        for step in self._runtime_steps:
+            if step.metadata.title.strip().casefold() != title_key:
+                continue
+            restarted = self._botting_tree.RestartFromNamedPlannerStep(step.planner_step_name, auto_start=True)
+            if restarted:
+                self._last_active_step_name = step.planner_step_name
+                self._apply_runtime_flags()
+                self._debug(f"Restarted from step {step.planner_step_name!r}.")
+            return restarted
+        return False
 
     def debug_snapshot(self) -> str:
         phase_current, phase_total, phase_title = self.get_phase_progress()
@@ -250,6 +274,11 @@ class BTRecipeRunner:
             reset=reset,
             repeat=self._loop,
         )
+        self._apply_runtime_flags()
+
+    def _apply_runtime_flags(self) -> None:
+        if self._suppress_party_wipe_recovery:
+            self._botting_tree.SetBlackboardValue("party_wipe_recovery_suppressed", True)
 
     def _make_step_builder(self, step: RuntimeStepView) -> Callable[[], BehaviorTree]:
         def _build_step_tree(step: RuntimeStepView = step) -> BehaviorTree:

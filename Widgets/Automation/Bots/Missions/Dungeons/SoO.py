@@ -37,7 +37,11 @@ WIDGETS_TO_ENABLE: tuple[str, ...] = (
     "Return to outpost on defeat",
 )
 WIDGETS_TO_DISABLE: tuple[str, ...] = ()
-_ALT_ONLY_DISABLE_WIDGETS: tuple[str, ...] = (BOT_NAME,)
+_ALT_ONLY_DISABLE_WIDGETS: tuple[str, ...] = (
+    BOT_NAME,
+    "SoO",
+    "Bone Dragon Staff",
+)
 
 # ==================== CONFIG ====================
 _SETTINGS_SECTION     = "Settings"
